@@ -5,10 +5,10 @@ list of NetworkOps that physically move parameter bytes from the source
 parallelism layout to the destination layout.
 
 NaiveP2PStrategy is the v1 implementation: it walks Llama parameter
-tensors, computes per-tensor (src_host, dst_host) byte movements based on
-the natural Megatron sharding scheme, aggregates by host pair, and emits
-one P2P NetworkOp per pair. The interface is intentionally generic — a
-future HybridFlowMicroDPStrategy can return arbitrary NetworkOp subclasses
+tensors, computes per-tensor (src_device, dst_device) byte movements based
+on the natural Megatron sharding scheme, aggregates by device pair, and
+emits one P2P NetworkOp per pair. The interface is intentionally generic —
+a future HybridFlowMicroDPStrategy can return arbitrary NetworkOp subclasses
 (e.g., AllGather within micro-DP groups) without changing transition.py.
 """
 
@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Optional
 from network_op import LogicalTransfer, NetworkOp, P2P
 from operators.llama_config import LlamaConfig
 from shard import Shard
+from topo import Device
 
 if TYPE_CHECKING:
     from model_mapping import ModelMapping
@@ -146,7 +147,7 @@ def _shards_at(mapping: "ModelMapping", dp: int, pp: int) -> dict[int, Shard]:
     """Returns {tp_rank: Shard} for the given (dp, pp) coordinate."""
     return {
         s.tp: s
-        for s in mapping.shards_to_host_ids
+        for s in mapping.shards_to_devices
         if s.dp == dp and s.pp == pp
     }
 
@@ -191,7 +192,7 @@ class NaiveP2PStrategy(ReshardingStrategy):
         params = _llama_parameters(arch)
         n_layers = arch.n_layers
 
-        agg: dict[tuple[int, int], int] = defaultdict(int)
+        agg: dict[tuple[Device, Device], int] = defaultdict(int)
         for p in params:
             for pair, bytes_moved in self._movements_for_param(
                 p, source, dest, n_layers
@@ -199,12 +200,12 @@ class NaiveP2PStrategy(ReshardingStrategy):
                 agg[pair] += bytes_moved
 
         ops: list[NetworkOp] = []
-        for (src_host, dst_host), bytes_total in agg.items():
+        for (src_device, dst_device), bytes_total in agg.items():
             if bytes_total <= 0:
                 continue
             transfer = LogicalTransfer(
-                src_host_id=src_host,
-                dst_host_id=dst_host,
+                src_device=src_device,
+                dst_device=dst_device,
                 data_GB=bytes_total / 1e9,
             )
             # P2P.DEFAULT_PHASE is BOUNDARY, which is what we want for
@@ -218,7 +219,7 @@ class NaiveP2PStrategy(ReshardingStrategy):
         source: "ModelMapping",
         dest: "ModelMapping",
         n_layers: int,
-    ) -> dict[tuple[int, int], int]:
+    ) -> dict[tuple[Device, Device], int]:
         src_pp = _pp_rank_for(param, source.parallelism.pp, n_layers)
         dst_pp = _pp_rank_for(param, dest.parallelism.pp, n_layers)
         src_shards = _shards_at(source, dp=0, pp=src_pp)
@@ -227,15 +228,15 @@ class NaiveP2PStrategy(ReshardingStrategy):
             return {}
 
         rows, cols = param.shape
-        movements: dict[tuple[int, int], int] = defaultdict(int)
+        movements: dict[tuple[Device, Device], int] = defaultdict(int)
 
         if param.shard_axis is None:
             # Replicated: one canonical source replica → one canonical dest
             # replica. Other dest TP ranks would receive via intra-TP broadcast
             # (not modeled here).
-            src_host = source.shards_to_host_ids[src_shards[0]]
-            dst_host = dest.shards_to_host_ids[dst_shards[0]]
-            movements[(src_host, dst_host)] = rows * cols * param.dtype_bytes
+            src_device = source.shards_to_devices[src_shards[0]]
+            dst_device = dest.shards_to_devices[dst_shards[0]]
+            movements[(src_device, dst_device)] = rows * cols * param.dtype_bytes
             return movements
 
         sharded_dim = param.shape[param.shard_axis]
@@ -258,14 +259,14 @@ class NaiveP2PStrategy(ReshardingStrategy):
 
         for src_t in range(src_tp):
             src_lo, src_hi = src_t * src_chunk, (src_t + 1) * src_chunk
-            src_host = source.shards_to_host_ids[src_shards[src_t]]
+            src_device = source.shards_to_devices[src_shards[src_t]]
             for dst_t in range(dst_tp):
                 dst_lo, dst_hi = dst_t * dst_chunk, (dst_t + 1) * dst_chunk
                 overlap = max(0, min(src_hi, dst_hi) - max(src_lo, dst_lo))
                 if overlap == 0:
                     continue
-                dst_host = dest.shards_to_host_ids[dst_shards[dst_t]]
-                movements[(src_host, dst_host)] += overlap * other_dim * param.dtype_bytes
+                dst_device = dest.shards_to_devices[dst_shards[dst_t]]
+                movements[(src_device, dst_device)] += overlap * other_dim * param.dtype_bytes
         return movements
 
 

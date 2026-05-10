@@ -34,61 +34,63 @@ from shard import Shard
 from simulator import simulate_rlhf_iteration
 from stages import RLHFTimeline
 from submesh_mapping import SubmeshMapping
-from topo import HostTopo, Link, Path as TopoPath
+from topo import Device, HostTopo, Link, Path as TopoPath
 from validation.scenarios import SCENARIOS, Scenario
+
+
+def _dev(host: int) -> Device:
+    """Single-device-per-host convention used by the validation harness."""
+    return Device(host_id=host, gpu_id=0)
+
+
+def _path_through_link(src: Device, dst: Device, shared: Link) -> TopoPath:
+    """Path from src to dst going through `shared`, with 0-latency
+    huge-bandwidth attach links so the shared link drives contention.
+    """
+    huge = 1e9
+    attach_src = Link(node_a_id=src, node_b_id=shared.node_a_id, bandwidth=huge, latency=0.0)
+    attach_dst = Link(node_a_id=shared.node_b_id, node_b_id=dst, bandwidth=huge, latency=0.0)
+    return TopoPath([attach_src, shared, attach_dst])
 
 
 # ---- topology + mapping helpers ---------------------------------------------
 
 
 def build_topology(num_hosts: int, spine_bandwidth_gbps: float) -> HostTopo:
-    """Single shared spine link between every host pair.
+    """Single shared spine link between every device pair.
 
-    Pessimistic baseline: ALL host pairs share one Link instance, so every
-    inter-host transfer in the cluster contends on the same logical pipe.
-    This bounds the worst case for cross-host collective contention but
+    Pessimistic baseline: ALL device pairs share one Link instance, so every
+    inter-device transfer in the cluster contends on the same logical pipe.
+    This bounds the worst case for cross-device collective contention but
     over-prices it on real NVLink/NVSwitch fabrics.
     """
     if num_hosts <= 1:
-        return HostTopo(
-            intra_host_bandwidth=1000.0,
-            intra_host_latency=0.0,
-            hosts_connections={},
-        )
+        return HostTopo(device_connections={})
     spine = Link(node_a_id=-1, node_b_id=-2, bandwidth=spine_bandwidth_gbps, latency=0.0)
-    spine_path = TopoPath(link=[spine])
     connections = {
-        (i, j): spine_path
+        (_dev(i), _dev(j)): _path_through_link(_dev(i), _dev(j), spine)
         for i in range(num_hosts)
         for j in range(num_hosts)
         if i != j
     }
-    return HostTopo(
-        intra_host_bandwidth=1000.0,
-        intra_host_latency=0.0,
-        hosts_connections=connections,
-    )
+    return HostTopo(device_connections=connections)
 
 
 def build_nvswitch_topology(
     num_hosts: int, link_bandwidth_gbps: float
 ) -> HostTopo:
-    """Full-bisection NVSwitch model: every ordered host pair gets its own
+    """Full-bisection NVSwitch model: every ordered device pair gets its own
     dedicated `Link` at NVLink-class bandwidth.
 
-    `link_loads` in `topo.HostTopo` is keyed by Link *object identity*, so
-    distinct Link instances don't contend with each other. This matches a
-    real single-node NVSwitch fabric where each GPU pair has a private
-    full-bandwidth lane: an 8-rank ring AllReduce running at NVLink-class
-    speeds doesn't bottleneck on a shared spine.
+    `link_loads` in `topo.HostTopo` is keyed by Link *object identity*
+    (frozen-dataclass hash), so distinct Link instances don't contend with
+    each other. This matches a real single-node NVSwitch fabric where each
+    GPU pair has a private full-bandwidth lane: an 8-rank ring AllReduce
+    running at NVLink-class speeds doesn't bottleneck on a shared spine.
     """
     if num_hosts <= 1:
-        return HostTopo(
-            intra_host_bandwidth=1000.0,
-            intra_host_latency=0.0,
-            hosts_connections={},
-        )
-    connections: dict[tuple[int, int], TopoPath] = {}
+        return HostTopo(device_connections={})
+    connections: dict[tuple[Device, Device], TopoPath] = {}
     for i in range(num_hosts):
         for j in range(num_hosts):
             if i == j:
@@ -97,12 +99,8 @@ def build_nvswitch_topology(
                 node_a_id=i, node_b_id=j,
                 bandwidth=link_bandwidth_gbps, latency=0.0,
             )
-            connections[(i, j)] = TopoPath(link=[link])
-    return HostTopo(
-        intra_host_bandwidth=1000.0,
-        intra_host_latency=0.0,
-        hosts_connections=connections,
-    )
+            connections[(_dev(i), _dev(j))] = _path_through_link(_dev(i), _dev(j), link)
+    return HostTopo(device_connections=connections)
 
 
 def build_multinode_topology(
@@ -121,11 +119,7 @@ def build_multinode_topology(
     single-spine pessimistic baseline.
     """
     if num_hosts <= 1:
-        return HostTopo(
-            intra_host_bandwidth=1000.0,
-            intra_host_latency=0.0,
-            hosts_connections={},
-        )
+        return HostTopo(device_connections={})
     if hosts_per_node <= 0:
         raise ValueError("hosts_per_node must be > 0")
 
@@ -135,7 +129,7 @@ def build_multinode_topology(
     # One inter-node Link per directed (node_a, node_b) pair.
     inter_node_links: dict[tuple[int, int], Link] = {}
 
-    connections: dict[tuple[int, int], TopoPath] = {}
+    connections: dict[tuple[Device, Device], TopoPath] = {}
     for i in range(num_hosts):
         for j in range(num_hosts):
             if i == j:
@@ -147,7 +141,6 @@ def build_multinode_topology(
                     node_a_id=i, node_b_id=j,
                     bandwidth=intra_node_bandwidth_gbps, latency=0.0,
                 )
-                connections[(i, j)] = TopoPath(link=[link])
             else:
                 # Inter-node: shared IB link per (node, node) pair.
                 key = (ni, nj)
@@ -159,12 +152,8 @@ def build_multinode_topology(
                         bandwidth=inter_node_bandwidth_gbps, latency=0.0,
                     )
                     inter_node_links[key] = link
-                connections[(i, j)] = TopoPath(link=[link])
-    return HostTopo(
-        intra_host_bandwidth=1000.0,
-        intra_host_latency=0.0,
-        hosts_connections=connections,
-    )
+            connections[(_dev(i), _dev(j))] = _path_through_link(_dev(i), _dev(j), link)
+    return HostTopo(device_connections=connections)
 
 
 def shard_grid(
@@ -195,21 +184,22 @@ def build_model_mapping(scenario: Scenario) -> tuple[ModelMapping, HostTopo]:
     )
     num_hosts, coords = shard_grid(scenario.parallelism)
     shards: list[Shard] = []
-    s2h: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    s2d: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     for host_id, (d, p, t, e) in enumerate(coords):
         s = Shard(model=model, dp=d, pp=p, tp=t, ep=e)
         shards.append(s)
-        s2h[s] = host_id
-        h2s[host_id] = s
-    mesh = Mesh(host_ids=list(range(num_hosts)), num_devices_per_host=1)
+        dev = _dev(host_id)
+        s2d[s] = dev
+        d2s[dev] = s
+    mesh = Mesh(devices=[_dev(i) for i in range(num_hosts)])
     mm = ModelMapping(
         model=model,
         mesh=mesh,
         workload=scenario.workload,
         parallelism=scenario.parallelism,
-        shards_to_host_ids=s2h,
-        host_id_to_shard=h2s,
+        shards_to_devices=s2d,
+        device_to_shard=d2s,
         # Leaving estimates empty: the validation focuses on operator-level
         # accuracy, not network sizing. Network ops contribute ~latency only.
         data_GB_estimates={},

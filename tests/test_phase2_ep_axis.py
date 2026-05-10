@@ -28,7 +28,12 @@ from operators.llama_config import LlamaConfig
 from operators.v3_block import build_v3_pattern
 from operators.v3_config import V3Config
 from shard import Shard
+from topo import Device
 from workload_context import Workload
+
+
+def _dev(host: int) -> Device:
+    return Device(host_id=host, gpu_id=0)
 
 
 SMALL_LLAMA = LlamaConfig(
@@ -76,21 +81,22 @@ def test_tp_and_ep_axes_coexist_on_same_mesh():
     shards along the EP axis (with TP fixed)."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    shards: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    shards: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     host = 0
     for ep in range(4):
         for tp in range(2):
             s = Shard(model=model, dp=0, pp=0, tp=tp, ep=ep)
-            shards[s] = host
-            h2s[host] = s
+            dev = _dev(host)
+            shards[s] = dev
+            d2s[dev] = s
             host += 1
-    mesh = Mesh(host_ids=list(range(host)), num_devices_per_host=1)
+    mesh = Mesh(devices=[_dev(i) for i in range(host)])
     mm = ModelMapping(
         model=model, mesh=mesh,
         workload=Workload.PREPARATION,
         parallelism=parallelism,
-        shards_to_host_ids=shards, host_id_to_shard=h2s,
+        shards_to_devices=shards, device_to_shard=d2s,
     )
 
     tp_group = mm._shards_in_group(ParallelismGroup.TP)
@@ -112,21 +118,22 @@ def test_ep_alltoall_walks_ep_ranks_not_tp_ranks():
     TP axis it used to alias). 4-rank AllToAll has 4*3 = 12 transfers."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    shards: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    shards: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     host = 0
     for ep in range(4):
         for tp in range(2):
             s = Shard(model=model, dp=0, pp=0, tp=tp, ep=ep)
-            shards[s] = host
-            h2s[host] = s
+            dev = _dev(host)
+            shards[s] = dev
+            d2s[dev] = s
             host += 1
-    mesh = Mesh(host_ids=list(range(host)), num_devices_per_host=1)
+    mesh = Mesh(devices=[_dev(i) for i in range(host)])
     mm = ModelMapping(
         model=model, mesh=mesh,
         workload=Workload.PREPARATION,
         parallelism=parallelism,
-        shards_to_host_ids=shards, host_id_to_shard=h2s,
+        shards_to_devices=shards, device_to_shard=d2s,
     )
 
     a2a_op = next(
@@ -143,21 +150,22 @@ def test_tp_ar_with_ep_active_walks_only_tp_ranks():
     span exactly TP ranks even when EP > 1 — i.e., 2 ranks not 8."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    shards: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    shards: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     host = 0
     for ep in range(4):
         for tp in range(2):
             s = Shard(model=model, dp=0, pp=0, tp=tp, ep=ep)
-            shards[s] = host
-            h2s[host] = s
+            dev = _dev(host)
+            shards[s] = dev
+            d2s[dev] = s
             host += 1
-    mesh = Mesh(host_ids=list(range(host)), num_devices_per_host=1)
+    mesh = Mesh(devices=[_dev(i) for i in range(host)])
     mm = ModelMapping(
         model=model, mesh=mesh,
         workload=Workload.PREPARATION,
         parallelism=parallelism,
-        shards_to_host_ids=shards, host_id_to_shard=h2s,
+        shards_to_devices=shards, device_to_shard=d2s,
     )
 
     ar_op = next(
@@ -174,19 +182,20 @@ def test_axis_validator_rejects_underprovisioned_ep_layout():
     model = _v3_model()
     parallelism = ParallelismConfig(tp=1, pp=1, dp=1, ep=4)
     # Bad layout: only 2 EP ranks, parallelism promises 4.
-    shards: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    shards: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     for ep in range(2):  # under-provisioned
         s = Shard(model=model, dp=0, pp=0, tp=0, ep=ep)
-        shards[s] = ep
-        h2s[ep] = s
-    mesh = Mesh(host_ids=[0, 1], num_devices_per_host=1)
+        dev = _dev(ep)
+        shards[s] = dev
+        d2s[dev] = s
+    mesh = Mesh(devices=[_dev(0), _dev(1)])
     with pytest.raises(ValueError, match="EP"):
         ModelMapping(
             model=model, mesh=mesh,
             workload=Workload.PREPARATION,
             parallelism=parallelism,
-            shards_to_host_ids=shards, host_id_to_shard=h2s,
+            shards_to_devices=shards, device_to_shard=d2s,
         )
 
 
@@ -194,15 +203,15 @@ def test_axis_validator_rejects_underprovisioned_tp_layout():
     model = _llama_model()
     parallelism = ParallelismConfig(tp=4, pp=1, dp=1, ep=1)
     # Only 2 TP shards, parallelism wants 4.
-    shards = {Shard(model=model, dp=0, pp=0, tp=t): t for t in range(2)}
-    h2s = {h: s for s, h in shards.items()}
-    mesh = Mesh(host_ids=[0, 1], num_devices_per_host=1)
+    shards = {Shard(model=model, dp=0, pp=0, tp=t): _dev(t) for t in range(2)}
+    d2s = {dev: s for s, dev in shards.items()}
+    mesh = Mesh(devices=[_dev(0), _dev(1)])
     with pytest.raises(ValueError, match="TP"):
         ModelMapping(
             model=model, mesh=mesh,
             workload=Workload.PREPARATION,
             parallelism=parallelism,
-            shards_to_host_ids=shards, host_id_to_shard=h2s,
+            shards_to_devices=shards, device_to_shard=d2s,
         )
 
 
@@ -211,11 +220,12 @@ def test_axis_validator_silent_when_degree_is_one():
     model = _llama_model()
     # Construct a single-shard layout with ep=0 (default) and parallelism ep=1.
     s = Shard(model=model, dp=0, pp=0, tp=0)
-    mesh = Mesh(host_ids=[0], num_devices_per_host=1)
+    dev = _dev(0)
+    mesh = Mesh(devices=[dev])
     # Should construct without raising (parallelism degrees all 1).
     ModelMapping(
         model=model, mesh=mesh,
         workload=Workload.PREPARATION,
         parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=1),
-        shards_to_host_ids={s: 0}, host_id_to_shard={0: s},
+        shards_to_devices={s: dev}, device_to_shard={dev: s},
     )

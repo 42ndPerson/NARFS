@@ -57,7 +57,7 @@ def boundary_transfer_times(
         return {}
     pair_times = topo.get_simultaneous_system_flow_time(transfers)
     return {
-        t: pair_times.get((t.src_host_id, t.dst_host_id), 0.0) for t in transfers
+        t: pair_times.get((t.src_device, t.dst_device), 0.0) for t in transfers
     }
 
 

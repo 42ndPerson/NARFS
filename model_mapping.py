@@ -33,6 +33,7 @@ from operators.builders import (
 from operators.optimizer import AdamOptimizerOp
 from relation import NetworkAssociation, NetworkPhase, Relation
 from shard import Shard
+from topo import Device
 from workload_context import Workload, WorkloadContext
 
 
@@ -120,8 +121,8 @@ class ModelMapping:
     mesh: Mesh
     workload: Workload
     parallelism: ParallelismConfig
-    shards_to_host_ids: dict[Shard, int]
-    host_id_to_shard: dict[int, Shard]
+    shards_to_devices: dict[Shard, Device]
+    device_to_shard: dict[Device, Shard]
     # Reference data_GB per collective kind for sizing the constructed
     # NetworkOps. Empty dict (default) treats every collective as 0-byte —
     # callers that want realistic contention should populate this with
@@ -338,7 +339,7 @@ class ModelMapping:
         fixed to the reference shard's values. With Phase 2's `Shard.ep`,
         TP and EP are independent axes and can coexist on the same mesh.
         """
-        all_shards = list(self.shards_to_host_ids.keys())
+        all_shards = list(self.shards_to_devices.keys())
         if not all_shards:
             return []
         ref = all_shards[0]
@@ -438,8 +439,8 @@ class ModelMapping:
         fwd_op = P2P(
             logical_transfers=[
                 LogicalTransfer(
-                    src_host_id=self.shards_to_host_ids[src],
-                    dst_host_id=self.shards_to_host_ids[dst],
+                    src_device=self.shards_to_devices[src],
+                    dst_device=self.shards_to_devices[dst],
                     data_GB=0.0,
                 )
             ],
@@ -460,8 +461,8 @@ class ModelMapping:
             bwd_op = P2P(
                 logical_transfers=[
                     LogicalTransfer(
-                        src_host_id=self.shards_to_host_ids[dst],
-                        dst_host_id=self.shards_to_host_ids[src],
+                        src_device=self.shards_to_devices[dst],
+                        dst_device=self.shards_to_devices[src],
                         data_GB=0.0,
                     )
                 ],

@@ -18,7 +18,12 @@ from operators.llama_builder import build_llama_pattern
 from operators.llama_config import LlamaConfig
 from operators.optimizer import AdamOptimizerOp
 from shard import Shard
+from topo import Device
 from workload_context import Workload, WorkloadContext
+
+
+def _dev(host: int) -> Device:
+    return Device(host_id=host, gpu_id=0)
 
 
 SMALL_LLAMA = LlamaConfig(
@@ -58,25 +63,26 @@ def _make_mapping(workload: Workload, parallelism: ParallelismConfig) -> ModelMa
     """
     model = _make_model()
     shards: list[Shard] = []
-    shards_to_host: dict[Shard, int] = {}
-    host_to_shard: dict[int, Shard] = {}
+    shards_to_dev: dict[Shard, Device] = {}
+    dev_to_shard: dict[Device, Shard] = {}
     host_id = 0
     for d in range(parallelism.dp):
         for p in range(parallelism.pp):
             for t in range(parallelism.tp):
                 s = Shard(model=model, dp=d, pp=p, tp=t)
                 shards.append(s)
-                shards_to_host[s] = host_id
-                host_to_shard[host_id] = s
+                dev = _dev(host_id)
+                shards_to_dev[s] = dev
+                dev_to_shard[dev] = s
                 host_id += 1
-    mesh = Mesh(host_ids=list(range(host_id)), num_devices_per_host=1)
+    mesh = Mesh(devices=[_dev(i) for i in range(host_id)])
     return ModelMapping(
         model=model,
         mesh=mesh,
         workload=workload,
         parallelism=parallelism,
-        shards_to_host_ids=shards_to_host,
-        host_id_to_shard=host_to_shard,
+        shards_to_devices=shards_to_dev,
+        device_to_shard=dev_to_shard,
     )
 
 
@@ -113,10 +119,10 @@ def test_tp2_emits_all_reduce_network_ops_on_correct_shards():
     # Ring on 2 TP shards → 2 logical transfers (host 0 → 1 → 0).
     assert len(ar_op.logical_transfers) == 2
     # Verify the transfers reference the TP-group shards (host 0 and host 1).
-    src_hosts = {t.src_host_id for t in ar_op.logical_transfers}
-    dst_hosts = {t.dst_host_id for t in ar_op.logical_transfers}
-    assert src_hosts == {0, 1}
-    assert dst_hosts == {0, 1}
+    src_hosts = {t.src_device for t in ar_op.logical_transfers}
+    dst_hosts = {t.dst_device for t in ar_op.logical_transfers}
+    assert src_hosts == {_dev(0), _dev(1)}
+    assert dst_hosts == {_dev(0), _dev(1)}
 
     # Each layer emits 2 AR requirements (attn_out + ffn_down) × 4 layers = 8.
     total_ar_uses = sum(
@@ -222,25 +228,26 @@ def test_pp_partition_v3_balances_cost():
     )
     parallelism = ParallelismConfig(tp=1, pp=4, dp=1, ep=1)
     shards: list[Shard] = []
-    s2h: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    s2d: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     host = 0
     for d in range(parallelism.dp):
         for p in range(parallelism.pp):
             for t in range(parallelism.tp):
                 s = Shard(model=model, dp=d, pp=p, tp=t)
                 shards.append(s)
-                s2h[s] = host
-                h2s[host] = s
+                dev = _dev(host)
+                s2d[s] = dev
+                d2s[dev] = s
                 host += 1
-    mesh = Mesh(host_ids=list(range(host)), num_devices_per_host=1)
+    mesh = Mesh(devices=[_dev(i) for i in range(host)])
     mm = ModelMapping(
         model=model,
         mesh=mesh,
         workload=Workload.PREPARATION,
         parallelism=parallelism,
-        shards_to_host_ids=s2h,
-        host_id_to_shard=h2s,
+        shards_to_devices=s2d,
+        device_to_shard=d2s,
     )
 
     # Compute per-stage cost at the reference workload the partitioner used.

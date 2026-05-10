@@ -127,8 +127,8 @@ class AllReduceRing(NetworkOp):
             for i in range(n):
                 next_i = (i + 1) % n
                 logical_transfers.append(LogicalTransfer(
-                    src_host_id=model_mapping.shards_to_host_ids[shards_ring[i]],
-                    dst_host_id=model_mapping.shards_to_host_ids[shards_ring[next_i]],
+                    src_device=model_mapping.shards_to_devices[shards_ring[i]],
+                    dst_device=model_mapping.shards_to_devices[shards_ring[next_i]],
                     data_GB=data_GB / n
                 ))
         return cls(logical_transfers=logical_transfers)
@@ -159,8 +159,8 @@ class AllGatherRing(NetworkOp):
             for i in range(n):
                 next_i = (i + 1) % n
                 logical_transfers.append(LogicalTransfer(
-                    src_host_id=model_mapping.shards_to_host_ids[shards_ring[i]],
-                    dst_host_id=model_mapping.shards_to_host_ids[shards_ring[next_i]],
+                    src_device=model_mapping.shards_to_devices[shards_ring[i]],
+                    dst_device=model_mapping.shards_to_devices[shards_ring[next_i]],
                     data_GB=data_GB / n
                 ))
         return cls(logical_transfers=logical_transfers)
@@ -210,8 +210,8 @@ class AllToAll(NetworkOp):
             for j in range(len(shards)):
                 if i != j:
                     logical_transfers.append(LogicalTransfer(
-                        src_host_id=model_mapping.shards_to_host_ids[shards[i]],
-                        dst_host_id=model_mapping.shards_to_host_ids[shards[j]],
+                        src_device=model_mapping.shards_to_devices[shards[i]],
+                        dst_device=model_mapping.shards_to_devices[shards[j]],
                         data_GB=data_GB / len(shards)
                     ))
         return cls(logical_transfers=logical_transfers)
@@ -243,12 +243,12 @@ class Broadcast(NetworkOp):
     @classmethod
     def generate(cls, model_mapping: ModelMapping, src_shard: Shard, dst_shards: list[Shard], data_GB: float) -> Broadcast:
         logical_transfers = []
-        src_host = model_mapping.shards_to_host_ids[src_shard]
+        src_device = model_mapping.shards_to_devices[src_shard]
         for dst in dst_shards:
             if src_shard != dst:
                 logical_transfers.append(LogicalTransfer(
-                    src_host_id=src_host,
-                    dst_host_id=model_mapping.shards_to_host_ids[dst],
+                    src_device=src_device,
+                    dst_device=model_mapping.shards_to_devices[dst],
                     data_GB=data_GB
                 ))
         return cls(logical_transfers=logical_transfers)
@@ -268,8 +268,8 @@ class P2P(NetworkOp):
     @classmethod
     def generate(cls, model_mapping: ModelMapping, src_shard: Shard, dst_shard: Shard, data_GB: float) -> P2P:
         return cls(logical_transfers=[LogicalTransfer(
-            src_host_id=model_mapping.shards_to_host_ids[src_shard],
-            dst_host_id=model_mapping.shards_to_host_ids[dst_shard],
+            src_device=model_mapping.shards_to_devices[src_shard],
+            dst_device=model_mapping.shards_to_devices[dst_shard],
             data_GB=data_GB
         )])
 

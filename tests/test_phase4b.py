@@ -28,12 +28,20 @@ from shard import Shard
 from simulator import simulate_rlhf_iteration, simulate_stage
 from stages import RLHFTimeline, StageBoundary
 from submesh_mapping import SubmeshMapping
-from topo import HostTopo, Link, Path
+from topo import Device, HostTopo, Link, Path
 from transition import StageTransition
 from workload_context import (
     Workload,
     WorkloadContext,
 )
+
+
+def _dev(host: int) -> Device:
+    return Device(host_id=host, gpu_id=0)
+
+
+def _mesh_for(host_ids: list[int]) -> Mesh:
+    return Mesh(devices=[_dev(h) for h in host_ids])
 
 
 # ---- shared fixtures ---------------------------------------------------------
@@ -60,20 +68,22 @@ A100 = HardwareSpec(
 
 
 def _make_topo(num_hosts: int, spine_bw_gbps: float = 100.0, link_latency_ms: float = 0.1) -> HostTopo:
-    """All inter-host traffic shares one logical spine link → contention is global."""
+    """All inter-device traffic shares one logical spine link → contention is global."""
     spine_link = Link(node_a_id=-1, node_b_id=-2, bandwidth=spine_bw_gbps, latency=link_latency_ms)
-    spine_path = Path(link=[spine_link])
+    huge = 1e9
+
+    def _path(src: Device, dst: Device) -> Path:
+        attach_src = Link(node_a_id=src, node_b_id=-1, bandwidth=huge, latency=0.0)
+        attach_dst = Link(node_a_id=-2, node_b_id=dst, bandwidth=huge, latency=0.0)
+        return Path([attach_src, spine_link, attach_dst])
+
     connections = {
-        (i, j): spine_path
+        (_dev(i), _dev(j)): _path(_dev(i), _dev(j))
         for i in range(num_hosts)
         for j in range(num_hosts)
         if i != j
     }
-    return HostTopo(
-        intra_host_bandwidth=1000.0,
-        intra_host_latency=0.01,
-        hosts_connections=connections,
-    )
+    return HostTopo(device_connections=connections)
 
 
 def _make_mapping(
@@ -88,26 +98,26 @@ def _make_mapping(
         raise ValueError(f"need {expected} hosts for {parallelism}, got {len(host_ids)}")
 
     shards: list[Shard] = []
-    s2h: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    s2d: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     idx = 0
     for d in range(parallelism.dp):
         for p in range(parallelism.pp):
             for t in range(parallelism.tp):
                 s = Shard(model=model, dp=d, pp=p, tp=t)
-                host = host_ids[idx]
+                dev = _dev(host_ids[idx])
                 idx += 1
                 shards.append(s)
-                s2h[s] = host
-                h2s[host] = s
-    mesh = Mesh(host_ids=list(host_ids), num_devices_per_host=1)
+                s2d[s] = dev
+                d2s[dev] = s
+    mesh = _mesh_for(host_ids)
     return ModelMapping(
         model=model,
         mesh=mesh,
         workload=workload,
         parallelism=parallelism,
-        shards_to_host_ids=s2h,
-        host_id_to_shard=h2s,
+        shards_to_devices=s2d,
+        device_to_shard=d2s,
         data_GB_estimates=data_GB_estimates or {},
     )
 
@@ -188,8 +198,8 @@ def test_rlhf_iteration_sums_stages_and_boundary():
         host_ids=[2, 3],
         data_GB_estimates={CollectiveKind.ALL_REDUCE: 0.001},
     )
-    train_sm = SubmeshMapping(model_mappings=[train_mm], submesh=Mesh([0, 1], 1))
-    gen_sm = SubmeshMapping(model_mappings=[gen_mm], submesh=Mesh([2, 3], 1))
+    train_sm = SubmeshMapping(model_mappings=[train_mm], submesh=_mesh_for([0, 1]))
+    gen_sm = SubmeshMapping(model_mappings=[gen_mm], submesh=_mesh_for([2, 3]))
     transition = StageTransition(source=train_mm, dest=gen_mm, strategy=NaiveP2PStrategy())
     timeline = RLHFTimeline(
         stages=[[train_sm], [gen_sm]],
@@ -225,14 +235,14 @@ def test_simulate_isolated_sums_actor_and_critic_in_same_submesh():
     actor_mm = _make_mapping(actor, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
     critic_mm = _make_mapping(critic, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
 
-    submesh = SubmeshMapping(model_mappings=[actor_mm, critic_mm], submesh=Mesh([0, 1], 1))
+    submesh = SubmeshMapping(model_mappings=[actor_mm, critic_mm], submesh=_mesh_for([0, 1]))
     topo = _make_topo(num_hosts=2)
     ctx = _ctx()
 
     isolated_time = submesh.simulate_isolated(ctx, A100, topo)
 
-    actor_alone = SubmeshMapping(model_mappings=[actor_mm], submesh=Mesh([0, 1], 1))
-    critic_alone = SubmeshMapping(model_mappings=[critic_mm], submesh=Mesh([0, 1], 1))
+    actor_alone = SubmeshMapping(model_mappings=[actor_mm], submesh=_mesh_for([0, 1]))
+    critic_alone = SubmeshMapping(model_mappings=[critic_mm], submesh=_mesh_for([0, 1]))
     actor_time = actor_alone.simulate_isolated(ctx, A100, topo)
     critic_time = critic_alone.simulate_isolated(ctx, A100, topo)
 
@@ -273,12 +283,12 @@ def test_simulate_stage_takes_max_over_disjoint_submeshes():
     topo = _make_topo(num_hosts=4)
     ctx = _ctx(prompt_len=128)
 
-    big_only = simulate_stage([SubmeshMapping([big_mm], Mesh([0, 1], 1))], ctx, A100, topo)
-    small_only = simulate_stage([SubmeshMapping([small_mm], Mesh([2, 3], 1))], ctx, A100, topo)
+    big_only = simulate_stage([SubmeshMapping([big_mm], _mesh_for([0, 1]))], ctx, A100, topo)
+    small_only = simulate_stage([SubmeshMapping([small_mm], _mesh_for([2, 3]))], ctx, A100, topo)
     both = simulate_stage(
         [
-            SubmeshMapping([big_mm], Mesh([0, 1], 1)),
-            SubmeshMapping([small_mm], Mesh([2, 3], 1)),
+            SubmeshMapping([big_mm], _mesh_for([0, 1])),
+            SubmeshMapping([small_mm], _mesh_for([2, 3])),
         ],
         ctx, A100, topo,
     )
@@ -321,8 +331,8 @@ def test_steady_contention_two_concurrent_submeshes_share_spine():
     topo = _make_topo(num_hosts=4, spine_bw_gbps=1.0, link_latency_ms=0.0)
     ctx = _ctx(prompt_len=64)
 
-    sm_a = SubmeshMapping([mm_a], Mesh([0, 1], 1))
-    sm_b = SubmeshMapping([mm_b], Mesh([2, 3], 1))
+    sm_a = SubmeshMapping([mm_a], _mesh_for([0, 1]))
+    sm_b = SubmeshMapping([mm_b], _mesh_for([2, 3]))
 
     alone = simulate_stage([sm_a], ctx, A100, topo)
     together = simulate_stage([sm_a, sm_b], ctx, A100, topo)
@@ -340,8 +350,8 @@ def test_steady_contention_two_concurrent_submeshes_share_spine():
 def test_topo_shared_bandwidth_reflects_contention():
     """Direct verification of the contention model the simulator depends on."""
     topo = _make_topo(num_hosts=4, spine_bw_gbps=10.0, link_latency_ms=0.0)
-    t1 = LogicalTransfer(src_host_id=0, dst_host_id=1, data_GB=1.0)
-    t2 = LogicalTransfer(src_host_id=2, dst_host_id=3, data_GB=1.0)
+    t1 = LogicalTransfer(src_device=_dev(0), dst_device=_dev(1), data_GB=1.0)
+    t2 = LogicalTransfer(src_device=_dev(2), dst_device=_dev(3), data_GB=1.0)
 
     bw_alone = topo.get_simultaneous_system_shared_bandwidth([t1])
     bw_together = topo.get_simultaneous_system_shared_bandwidth([t1, t2])

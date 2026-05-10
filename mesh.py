@@ -1,12 +1,19 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
+
+from topo import Device
+
 
 @dataclass
 class SubMeshes:
-    submeshes: list[Mesh] # list of submeshes, each submesh is a subset of the full mesh that can run model(s) independently
+    submeshes: list[Mesh]  # subsets of the full mesh, each runs model(s) independently
+
 
 @dataclass
 class Mesh:
-    host_ids: list[int] # list of host IDs in the mesh
-    num_devices_per_host: int # number of devices per host
+    """A flat list of Devices a model is mapped onto.
+
+    Devices carry their own (host_id, gpu_id) so the mesh no longer needs
+    to encode host grouping or per-host device count separately.
+    """
+    devices: list[Device]

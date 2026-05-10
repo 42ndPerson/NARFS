@@ -39,7 +39,7 @@ from operators.llama_builder import build_llama_pattern
 from operators.llama_config import LlamaConfig
 from relation import Relation
 from shard import Shard
-from topo import HostTopo, Link, Path
+from topo import Device, HostTopo, Link, Path
 from workload_context import (
     TokenCount,
     Workload,
@@ -70,23 +70,30 @@ A100 = HardwareSpec(
 )
 
 
+def _dev(host: int) -> Device:
+    """One device per host in these tests; gpu_id=0 by convention."""
+    return Device(host_id=host, gpu_id=0)
+
+
 def _shared_spine_topo(num_hosts: int, bw_gbps: float = 100.0) -> HostTopo:
-    """All inter-host pairs share one spine link (so we can reason about
+    """All inter-device pairs share one spine link (so we can reason about
     aggregate AR bandwidth analytically). Zero latency keeps the math clean.
     """
     spine = Link(node_a_id=-1, node_b_id=-2, bandwidth=bw_gbps, latency=0.0)
-    spine_path = Path(link=[spine])
+    huge = 1e9
+
+    def _path(src: Device, dst: Device) -> Path:
+        attach_src = Link(node_a_id=src, node_b_id=-1, bandwidth=huge, latency=0.0)
+        attach_dst = Link(node_a_id=-2, node_b_id=dst, bandwidth=huge, latency=0.0)
+        return Path([attach_src, spine, attach_dst])
+
     connections = {
-        (i, j): spine_path
+        (_dev(i), _dev(j)): _path(_dev(i), _dev(j))
         for i in range(num_hosts)
         for j in range(num_hosts)
         if i != j
     }
-    return HostTopo(
-        intra_host_bandwidth=1000.0,
-        intra_host_latency=0.0,
-        hosts_connections=connections,
-    )
+    return HostTopo(device_connections=connections)
 
 
 def _make_mapping(parallelism: ParallelismConfig) -> ModelMapping:
@@ -96,24 +103,25 @@ def _make_mapping(parallelism: ParallelismConfig) -> ModelMapping:
         architecture=SMALL_LLAMA,
         build_pattern=build_llama_pattern,
     )
-    shards: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    shards: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     host = 0
     for d in range(parallelism.dp):
         for p in range(parallelism.pp):
             for t in range(parallelism.tp):
                 s = Shard(model=model, dp=d, pp=p, tp=t)
-                shards[s] = host
-                h2s[host] = s
+                dev = _dev(host)
+                shards[s] = dev
+                d2s[dev] = s
                 host += 1
-    mesh = Mesh(host_ids=list(range(host)), num_devices_per_host=1)
+    mesh = Mesh(devices=[_dev(i) for i in range(host)])
     return ModelMapping(
         model=model,
         mesh=mesh,
         workload=Workload.PREPARATION,
         parallelism=parallelism,
-        shards_to_host_ids=shards,
-        host_id_to_shard=h2s,
+        shards_to_devices=shards,
+        device_to_shard=d2s,
     )
 
 
@@ -312,9 +320,9 @@ def test_legacy_data_GB_estimates_still_works_when_no_data_GB_fn():
 def test_refresh_data_size_ring_splits_evenly():
     """Ring patterns (AllReduce/Gather/ReduceScatter) split total/n per transfer."""
     transfers = [
-        LogicalTransfer(src_host_id=0, dst_host_id=1, data_GB=0.0),
-        LogicalTransfer(src_host_id=1, dst_host_id=2, data_GB=0.0),
-        LogicalTransfer(src_host_id=2, dst_host_id=0, data_GB=0.0),
+        LogicalTransfer(src_device=_dev(0), dst_device=_dev(1), data_GB=0.0),
+        LogicalTransfer(src_device=_dev(1), dst_device=_dev(2), data_GB=0.0),
+        LogicalTransfer(src_device=_dev(2), dst_device=_dev(0), data_GB=0.0),
     ]
     op = AllReduceRing(logical_transfers=transfers)
     op.refresh_data_size(0.6)
@@ -327,7 +335,7 @@ def test_refresh_data_size_alltoall_splits_by_N_not_num_transfers():
     (not total/N(N-1)). The per-subclass refresh solves N from transfer count."""
     # 4 nodes (0..3), each sends to 3 others → 12 transfers.
     transfers = [
-        LogicalTransfer(src_host_id=i, dst_host_id=j, data_GB=0.0)
+        LogicalTransfer(src_device=_dev(i), dst_device=_dev(j), data_GB=0.0)
         for i in range(4) for j in range(4) if i != j
     ]
     assert len(transfers) == 12
@@ -341,8 +349,8 @@ def test_refresh_data_size_alltoall_splits_by_N_not_num_transfers():
 def test_refresh_data_size_broadcast_full_per_transfer():
     """Broadcast: each receiver gets the full payload."""
     transfers = [
-        LogicalTransfer(src_host_id=0, dst_host_id=1, data_GB=0.0),
-        LogicalTransfer(src_host_id=0, dst_host_id=2, data_GB=0.0),
+        LogicalTransfer(src_device=_dev(0), dst_device=_dev(1), data_GB=0.0),
+        LogicalTransfer(src_device=_dev(0), dst_device=_dev(2), data_GB=0.0),
     ]
     op = Broadcast(logical_transfers=transfers)
     op.refresh_data_size(0.5)
@@ -352,7 +360,7 @@ def test_refresh_data_size_broadcast_full_per_transfer():
 
 def test_refresh_data_size_p2p_full_payload():
     """P2P: single transfer carries the full payload."""
-    op = P2P(logical_transfers=[LogicalTransfer(src_host_id=0, dst_host_id=1, data_GB=0.0)])
+    op = P2P(logical_transfers=[LogicalTransfer(src_device=_dev(0), dst_device=_dev(1), data_GB=0.0)])
     op.refresh_data_size(0.7)
     assert op.logical_transfers[0].data_GB == pytest.approx(0.7)
 

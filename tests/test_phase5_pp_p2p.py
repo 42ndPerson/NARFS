@@ -31,8 +31,12 @@ from relation import NetworkPhase
 from shard import Shard
 from simulator import simulate_stage
 from submesh_mapping import SubmeshMapping
-from topo import HostTopo, Link, Path
+from topo import Device, HostTopo, Link, Path
 from workload_context import Workload, WorkloadContext
+
+
+def _dev(host: int) -> Device:
+    return Device(host_id=host, gpu_id=0)
 
 
 SMALL_LLAMA = LlamaConfig(
@@ -49,11 +53,18 @@ A100 = HardwareSpec(
 
 def _make_topo(num_hosts: int, spine_bw_gbps: float = 100.0) -> HostTopo:
     spine_link = Link(node_a_id=-1, node_b_id=-2, bandwidth=spine_bw_gbps, latency=0.1)
-    spine_path = Path(link=[spine_link])
+    huge = 1e9
+
+    def _path(src: Device, dst: Device) -> Path:
+        attach_src = Link(node_a_id=src, node_b_id=-1, bandwidth=huge, latency=0.0)
+        attach_dst = Link(node_a_id=-2, node_b_id=dst, bandwidth=huge, latency=0.0)
+        return Path([attach_src, spine_link, attach_dst])
+
     connections = {
-        (i, j): spine_path for i in range(num_hosts) for j in range(num_hosts) if i != j
+        (_dev(i), _dev(j)): _path(_dev(i), _dev(j))
+        for i in range(num_hosts) for j in range(num_hosts) if i != j
     }
-    return HostTopo(intra_host_bandwidth=1000.0, intra_host_latency=0.01, hosts_connections=connections)
+    return HostTopo(device_connections=connections)
 
 
 def _make_model() -> Model:
@@ -68,20 +79,21 @@ def _make_mapping(
     parallelism: ParallelismConfig, workload: Workload, host_ids: list[int],
 ) -> ModelMapping:
     model = _make_model()
-    shards: dict[Shard, int] = {}
-    h2s: dict[int, Shard] = {}
+    shards: dict[Shard, Device] = {}
+    d2s: dict[Device, Shard] = {}
     idx = 0
     for d in range(parallelism.dp):
         for p in range(parallelism.pp):
             for t in range(parallelism.tp):
                 s = Shard(model=model, dp=d, pp=p, tp=t)
-                shards[s] = host_ids[idx]
-                h2s[host_ids[idx]] = s
+                dev = _dev(host_ids[idx])
+                shards[s] = dev
+                d2s[dev] = s
                 idx += 1
-    mesh = Mesh(host_ids=list(host_ids), num_devices_per_host=1)
+    mesh = Mesh(devices=[_dev(h) for h in host_ids])
     return ModelMapping(
         model=model, mesh=mesh, workload=workload, parallelism=parallelism,
-        shards_to_host_ids=shards, host_id_to_shard=h2s,
+        shards_to_devices=shards, device_to_shard=d2s,
     )
 
 
@@ -158,8 +170,8 @@ def test_pp_p2p_forward_goes_pp0_to_pp1_backward_reverses():
     assert len(bwd.logical_transfers) == 1
     fwd_t = fwd.logical_transfers[0]
     bwd_t = bwd.logical_transfers[0]
-    assert (fwd_t.src_host_id, fwd_t.dst_host_id) == (10, 20)
-    assert (bwd_t.src_host_id, bwd_t.dst_host_id) == (20, 10)
+    assert (fwd_t.src_device, fwd_t.dst_device) == (_dev(10), _dev(20))
+    assert (bwd_t.src_device, bwd_t.dst_device) == (_dev(20), _dev(10))
 
 
 # ---- sizing ------------------------------------------------------------------
@@ -204,7 +216,7 @@ def test_pp_bubble_formula_includes_p2p_per_mb_additively():
     the additive term is present and grows with prompt_len."""
     topo = _make_topo(num_hosts=2)
     pp2 = _make_mapping(ParallelismConfig(tp=1, pp=2, dp=1), Workload.PREPARATION, [0, 1])
-    sm = SubmeshMapping([pp2], Mesh([0, 1], 1))
+    sm = SubmeshMapping([pp2], Mesh(devices=[_dev(0), _dev(1)]))
 
     ctx_short = _ctx(prompt_len=64, num_microbatches=2)
     ctx_long = _ctx(prompt_len=512, num_microbatches=2)
