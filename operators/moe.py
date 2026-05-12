@@ -1,13 +1,21 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable
 
 from hardware import HardwareSpec
+from network_requirement import ParallelismConfig
 from operator_base import Operator
 from operators.elementwise import SwiGLUActivation
 from operators.gemm import Gemm
 from operators.v3_config import V3Config
+from parallelism_role import EPMode, ParallelismRole, TPMode
 from workload_context import WorkloadContext
+
+
+_REP = ParallelismRole()
+_COL = ParallelismRole(tp=TPMode.COLUMN_PARALLEL)
+_ROW = ParallelismRole(tp=TPMode.ROW_PARALLEL)
+_EP = ParallelismRole(ep=EPMode.EXPERT_PARALLEL)
 
 
 @dataclass(frozen=True)
@@ -19,13 +27,18 @@ class DispatchMarker(Operator):
     timing model.
     """
 
-    def compute_flops(self, ctx: WorkloadContext) -> float:
+    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
+        del ctx, par
         return 0.0
 
-    def memory_bytes(self, ctx: WorkloadContext) -> float:
+    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
+        del ctx, par
         return 0.0
 
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+    def is_compute_bound(
+        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
+    ) -> bool:
+        del ctx, hw, par
         return False
 
 
@@ -33,37 +46,41 @@ class DispatchMarker(Operator):
 class CombineMarker(Operator):
     """Zero-cost attachment point for the combine all-to-all (post-experts)."""
 
-    def compute_flops(self, ctx: WorkloadContext) -> float:
+    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
+        del ctx, par
         return 0.0
 
-    def memory_bytes(self, ctx: WorkloadContext) -> float:
+    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
+        del ctx, par
         return 0.0
 
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+    def is_compute_bound(
+        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
+    ) -> bool:
+        del ctx, hw, par
         return False
 
 
 def build_moe_ffn(
     cfg: V3Config,
     derive_t: Callable[[WorkloadContext], float],
-    m_expert_shared_local: Optional[int] = None,
 ) -> list[Operator]:
     """One MoE FFN: router + dispatch + grouped routed experts + combine + shared expert.
 
-    The grouped routed-expert ops carry n_replicas=n_routed_experts so
-    parameter accounting reflects all expert weights, but compute/memory are
-    sized to a single (bottleneck) expert's per-call work — the experts run
-    in parallel on different ranks.
+    Routed-expert grouped GEMMs carry n_replicas=n_routed_experts (parameter
+    accounting reflects all expert weights) but compute/memory are sized to a
+    single expert's per-call work — the experts run in parallel on EP ranks.
+    Their `parallelism_role.ep == EXPERT_PARALLEL` so per-rank parameter
+    bytes correctly divide by `par.ep`.
 
-    The shared expert is TP-sharded: callers pass `m_expert_shared_local`
-    (defaulting to full `cfg.m_expert`). Routed experts are EP-sharded only;
-    they keep full `m_expert`.
+    The shared expert is TP-sharded along the intermediate dim with full
+    `m_expert` shape and column/row roles; per-rank size is derived inside
+    the operator at compute time.
     """
     n_routed = cfg.n_routed_experts
     top_k = cfg.top_k
     imb = cfg.moe_imbalance_factor
     dtype = cfg.dtype_bytes
-    m_shared = cfg.m_expert if m_expert_shared_local is None else m_expert_shared_local
 
     # Per-expert M for the routed grouped GEMMs: average tokens-per-expert
     # scaled by imbalance to model the slowest-expert bottleneck.
@@ -73,27 +90,37 @@ def build_moe_ffn(
 
     return [
         # Router scores all tokens against every routed expert.
-        Gemm(n=n_routed, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t),
+        Gemm(n=n_routed, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t,
+             parallelism_role=_REP),
         DispatchMarker(),
-        # Grouped routed experts (one Gemm per slice of the FFN).
+        # Grouped routed experts (one Gemm per slice of the FFN). EP-sharded
+        # only — no TP split inside an expert.
         Gemm(
             n=cfg.m_expert, k=cfg.h, dtype_bytes=dtype,
             n_replicas=n_routed, replicas_active=top_k, derive_M=expert_M,
+            parallelism_role=_EP,
         ),
         Gemm(
             n=cfg.m_expert, k=cfg.h, dtype_bytes=dtype,
             n_replicas=n_routed, replicas_active=top_k, derive_M=expert_M,
+            parallelism_role=_EP,
         ),
-        SwiGLUActivation(intermediate_size=cfg.m_expert, dtype_bytes=dtype, derive_t=expert_M),
+        SwiGLUActivation(intermediate_size=cfg.m_expert, dtype_bytes=dtype, derive_t=expert_M,
+                         parallelism_role=_REP),
         Gemm(
             n=cfg.h, k=cfg.m_expert, dtype_bytes=dtype,
             n_replicas=n_routed, replicas_active=top_k, derive_M=expert_M,
+            parallelism_role=_EP,
         ),
         CombineMarker(),
         # Shared expert (always active for every token), n_shared_experts == 1.
-        # TP-sharded along intermediate dim.
-        Gemm(n=m_shared, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t),
-        Gemm(n=m_shared, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t),
-        SwiGLUActivation(intermediate_size=m_shared, dtype_bytes=dtype, derive_t=derive_t),
-        Gemm(n=cfg.h, k=m_shared, dtype_bytes=dtype, derive_M=derive_t),
+        # TP-sharded with column/row roles along the intermediate dim.
+        Gemm(n=cfg.m_expert, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t,
+             parallelism_role=_COL),
+        Gemm(n=cfg.m_expert, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t,
+             parallelism_role=_COL),
+        SwiGLUActivation(intermediate_size=cfg.m_expert, dtype_bytes=dtype, derive_t=derive_t,
+                         parallelism_role=_COL),
+        Gemm(n=cfg.h, k=cfg.m_expert, dtype_bytes=dtype, derive_M=derive_t,
+             parallelism_role=_ROW),
     ]

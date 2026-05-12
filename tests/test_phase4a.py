@@ -4,7 +4,6 @@ import pytest
 
 from hardware import HardwareSpec
 from mesh import Mesh
-from model import Model
 from model_mapping import ModelMapping
 from network_op import AllReduceRing
 from network_requirement import (
@@ -14,7 +13,7 @@ from network_requirement import (
     ParallelismGroup,
 )
 from operators.backward import BackwardOp
-from operators.llama_builder import build_llama_pattern
+from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.optimizer import AdamOptimizerOp
 from shard import Shard
@@ -47,12 +46,11 @@ A100 = HardwareSpec(
 )
 
 
-def _make_model() -> Model:
-    return Model(
+def _make_model() -> LlamaModel:
+    return LlamaModel(
         name="small_llama",
         role="actor",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
 
 
@@ -165,8 +163,8 @@ def test_training_includes_backward_and_per_layer_optimizer():
     # Spot-check 3x scaling on a backward op: pick one and compare to its forward.
     sample = backward_ops[0]
     ctx = _ctx()
-    fwd_flops = sample.forward.compute_flops(ctx)
-    bwd_flops = sample.compute_flops(ctx)
+    fwd_flops = sample.forward.compute_flops(ctx, mm.parallelism)
+    bwd_flops = sample.compute_flops(ctx, mm.parallelism)
     if fwd_flops > 0:
         assert bwd_flops == pytest.approx(3.0 * fwd_flops)
 
@@ -216,15 +214,14 @@ def test_pp_partition_v3_balances_cost():
     stage costs (per-layer kernel_time at the reference workload). Dense layers
     are much cheaper than MoE; cost-balanced partition naturally clusters
     several dense layers on one stage while spreading MoE across the rest."""
-    from operators.v3_block import build_v3_pattern
+    from operators.v3_block import V3Model
     from operators.v3_config import V3Config
 
     arch = V3Config()
-    model = Model(
+    model = V3Model(
         name="v3_small",
         role="actor",
         architecture=arch,
-        build_pattern=build_v3_pattern,
     )
     parallelism = ParallelismConfig(tp=1, pp=4, dp=1, ep=1)
     shards: list[Shard] = []
@@ -255,7 +252,7 @@ def test_pp_partition_v3_balances_cost():
     ref_ctx = mm._reference_partition_ctx()
     stage_costs = [
         sum(
-            mm.operator_pattern[i].kernel_time(ref_ctx, _PARTITION_REF_HW)
+            mm.operator_pattern[i].kernel_time(ref_ctx, _PARTITION_REF_HW, mm.parallelism)
             for i in op_indices
         )
         for op_indices in mm.pipeline_partition

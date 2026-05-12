@@ -62,35 +62,40 @@ def _ctx(prompt_len: int = 128) -> WorkloadContext:
 def test_mla_prefill_q_up_kv_up_attn_out_shrink_under_tp():
     cfg = V3Config()
     tp = 4
-    ops_full = build_mla_prefill(cfg)
-    ops_sharded = build_mla_prefill(cfg, tp=tp)
+    par = ParallelismConfig(tp=tp)
+    ops = build_mla_prefill(cfg, tp=tp)
 
+    # Operators carry full-model shapes; per-rank dims derive from role + par.
     # Layout: q_down, q_up, kv_down, kv_up, rope, attention, attn_out
-    q_up_full = ops_full[1]
-    q_up_sharded = ops_sharded[1]
-    assert isinstance(q_up_full, Gemm) and isinstance(q_up_sharded, Gemm)
-    assert q_up_sharded.n == q_up_full.n // tp
+    q_up = ops[1]
+    assert isinstance(q_up, Gemm)
+    expected_full_n = cfg.n_h * (cfg.head_size + cfg.d_rope)
+    assert q_up.n == expected_full_n
+    n_eff, _ = q_up._shape(par)
+    assert n_eff == expected_full_n // tp
 
-    kv_up_full = ops_full[3]
-    kv_up_sharded = ops_sharded[3]
-    assert isinstance(kv_up_full, Gemm) and isinstance(kv_up_sharded, Gemm)
-    assert kv_up_sharded.n == kv_up_full.n // tp
+    kv_up = ops[3]
+    assert isinstance(kv_up, Gemm)
+    expected_kv_n = cfg.n_h * 2 * cfg.head_size
+    assert kv_up.n == expected_kv_n
+    n_eff, _ = kv_up._shape(par)
+    assert n_eff == expected_kv_n // tp
 
-    rope_full = ops_full[4]
-    rope_sharded = ops_sharded[4]
-    assert isinstance(rope_full, RoPE) and isinstance(rope_sharded, RoPE)
-    assert rope_sharded.num_heads == rope_full.num_heads // tp
+    rope = ops[4]
+    assert isinstance(rope, RoPE)
+    assert rope.num_heads == cfg.n_h
+    assert rope._heads(par) == cfg.n_h // tp
 
-    attn_full = ops_full[5]
-    attn_sharded = ops_sharded[5]
-    assert isinstance(attn_full, PrefillAttention) and isinstance(attn_sharded, PrefillAttention)
-    assert attn_sharded.num_heads == attn_full.num_heads // tp
-    assert attn_sharded.num_kv_heads == attn_full.num_kv_heads // tp
+    attn = ops[5]
+    assert isinstance(attn, PrefillAttention)
+    assert attn.num_heads == cfg.n_h
+    assert attn._heads(par) == cfg.n_h // tp
 
-    attn_out_full = ops_full[6]
-    attn_out_sharded = ops_sharded[6]
-    assert isinstance(attn_out_full, Gemm) and isinstance(attn_out_sharded, Gemm)
-    assert attn_out_sharded.k == attn_out_full.k // tp
+    attn_out = ops[6]
+    assert isinstance(attn_out, Gemm)
+    assert attn_out.k == cfg.n_h * cfg.head_size
+    _, k_eff = attn_out._shape(par)
+    assert k_eff == (cfg.n_h * cfg.head_size) // tp
 
 
 def test_mla_prefill_q_down_kv_down_unchanged_under_tp():
@@ -108,9 +113,12 @@ def test_mla_prefill_q_down_kv_down_unchanged_under_tp():
 
 def test_mla_decode_attn_uses_local_head_count():
     cfg = V3Config()
+    par = ParallelismConfig(tp=2)
     ops = build_mla_decode(cfg, tp=2)
     attn = next(op for op in ops if isinstance(op, DecodeAttention))
-    assert attn.num_heads == cfg.n_h // 2
+    # Full-model heads stored; per-rank derived from role + par.
+    assert attn.num_heads == cfg.n_h
+    assert attn._heads(par) == cfg.n_h // 2
 
 
 def test_mla_rejects_nondivisible_tp():
@@ -130,12 +138,13 @@ def test_v3_dense_ffn_intermediate_shrinks_under_tp():
     parallelism = ParallelismConfig(tp=4)
     ops_with_reqs = build_v3_dense_layer(cfg, TokenCount.PREFILL, parallelism)
     ffn_gemms = [op for op, _ in ops_with_reqs if isinstance(op, Gemm)]
-    # The dense FFN appears at the end of the layer; the last 4 entries are
-    # the FFN gates, ups, swiglu, down. The 3 GEMMs (gate, up, down) bracket
-    # the swiglu. Inspect the down (last) — its k should be m_dense // tp.
+    # ffn_down is the last Gemm. Operators carry full-model shapes; per-rank
+    # k derives from ROW_PARALLEL role + par.tp.
     ffn_down = ffn_gemms[-1]
     assert ffn_down.n == cfg.h
-    assert ffn_down.k == cfg.m_dense // 4
+    assert ffn_down.k == cfg.m_dense
+    _, k_eff = ffn_down._shape(parallelism)
+    assert k_eff == cfg.m_dense // 4
 
 
 def test_v3_dense_layer_rejects_nondivisible_m_dense():
@@ -151,28 +160,37 @@ def test_v3_dense_layer_rejects_nondivisible_m_dense():
 def test_v3_moe_shared_expert_shrinks_under_tp_routed_unchanged():
     cfg = V3Config()
     tp = 4
-    ops_with_reqs_full = build_v3_moe_layer(cfg, TokenCount.PREFILL, ParallelismConfig(tp=1))
-    ops_with_reqs_sharded = build_v3_moe_layer(cfg, TokenCount.PREFILL, ParallelismConfig(tp=tp))
+    par = ParallelismConfig(tp=tp)
+    ops_with_reqs = build_v3_moe_layer(cfg, TokenCount.PREFILL, par)
 
-    # Routed experts have n_replicas=n_routed_experts; shared expert has 1.
-    routed_full = [op for op, _ in ops_with_reqs_full if isinstance(op, Gemm) and op.n_replicas == cfg.n_routed_experts]
-    routed_sharded = [op for op, _ in ops_with_reqs_sharded if isinstance(op, Gemm) and op.n_replicas == cfg.n_routed_experts]
-    # Routed ops keep full m_expert (they're EP-sharded, not TP-sharded).
-    assert all(op.n == cfg.m_expert or op.k == cfg.m_expert for op in routed_full)
-    assert all(op.n == cfg.m_expert or op.k == cfg.m_expert for op in routed_sharded)
+    # Operators carry full-model shapes; verify role-driven per-rank derivation.
+    routed: list[Gemm] = [
+        op for op, _ in ops_with_reqs
+        if isinstance(op, Gemm) and op.n_replicas == cfg.n_routed_experts
+    ]
+    # Routed experts are EP-sharded only — TP role is REPLICATED so per-rank
+    # shape equals stored shape under any TP degree.
+    for r in routed:
+        n_eff, k_eff = r._shape(par)
+        assert n_eff == r.n and k_eff == r.k
+        assert r.n == cfg.m_expert or r.k == cfg.m_expert
 
-    # Shared-expert gemms have the (m_expert, h) dimension pair: gate/up are
-    # (n=m_expert, k=h); down is (n=h, k=m_expert). Other Gemms in the layer
-    # have at least one dimension that is neither h nor m_expert.
-    def _is_shared_expert(op, m_shared):
-        if not isinstance(op, Gemm) or op.n_replicas != 1:
+    # Shared expert: 3 Gemms (gate, up, down). gate/up are COLUMN_PARALLEL
+    # (n divides), down is ROW_PARALLEL (k divides). Stored shapes are full;
+    # per-rank shapes shrink by tp.
+    def _is_shared_expert(op: Gemm) -> bool:
+        if op.n_replicas != 1:
             return False
-        return (op.n == m_shared and op.k == cfg.h) or (op.n == cfg.h and op.k == m_shared)
+        return (op.n == cfg.m_expert and op.k == cfg.h) or (op.n == cfg.h and op.k == cfg.m_expert)
 
-    shared_full = [op for op, _ in ops_with_reqs_full if _is_shared_expert(op, cfg.m_expert)]
-    shared_sharded = [op for op, _ in ops_with_reqs_sharded if _is_shared_expert(op, cfg.m_expert // tp)]
-    assert len(shared_full) == 3  # gate, up, down
-    assert len(shared_sharded) == 3
+    shared: list[Gemm] = [
+        op for op, _ in ops_with_reqs
+        if isinstance(op, Gemm) and _is_shared_expert(op)
+    ]
+    assert len(shared) == 3
+    for s in shared:
+        n_eff, k_eff = s._shape(par)
+        assert (n_eff == s.n // tp and k_eff == s.k) or (n_eff == s.n and k_eff == s.k // tp)
 
 
 def test_v3_moe_layer_rejects_nondivisible_m_expert():
@@ -188,13 +206,17 @@ def test_v3_moe_layer_rejects_nondivisible_m_expert():
 def test_v3_lm_head_shrinks_and_emits_all_gather_under_tp():
     cfg = V3Config()
     tp = 4
-    pattern = build_v3_model(cfg, TokenCount.PREFILL, ParallelismConfig(tp=tp))
+    par = ParallelismConfig(tp=tp)
+    pattern = build_v3_model(cfg, TokenCount.PREFILL, par)
     ops, reqs = split_pattern(expand_tagged_pattern(pattern))
     lm_head = ops[-1]
     lm_head_reqs = reqs[-1]
     assert isinstance(lm_head, Gemm)
-    assert lm_head.n == cfg.vocab // tp
+    # Operators carry full-model shapes; per-rank shape derives at compute time.
+    assert lm_head.n == cfg.vocab
     assert lm_head.k == cfg.h
+    n_eff, _ = lm_head._shape(par)
+    assert n_eff == cfg.vocab // tp
     # AllGather requirement on TP group.
     assert any(
         isinstance(r, NetworkRequirement)
@@ -215,13 +237,18 @@ def test_v3_lm_head_no_all_gather_when_tp_eq_one():
 def test_llama_lm_head_shrinks_and_emits_all_gather_under_tp():
     arch = SMALL_LLAMA
     tp = 4
-    pattern = build_llama_pattern(arch, "training", ParallelismConfig(tp=tp))
+    par = ParallelismConfig(tp=tp)
+    pattern = build_llama_pattern(arch, "training", par)
     ops, reqs = split_pattern(expand_tagged_pattern(pattern))
     lm_head = ops[-1]
     lm_head_reqs = reqs[-1]
     assert isinstance(lm_head, Gemm)
-    assert lm_head.n == arch.vocab // tp
+    # Operators carry full-model shapes; per-rank shape is derived at compute time.
+    assert lm_head.n == arch.vocab
     assert lm_head.k == arch.h
+    n_eff, k_eff = lm_head._shape(par)
+    assert n_eff == arch.vocab // tp
+    assert k_eff == arch.h
     assert any(
         isinstance(r, NetworkRequirement)
         and r.kind is CollectiveKind.ALL_GATHER

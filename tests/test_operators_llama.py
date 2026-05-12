@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from hardware import HardwareSpec
+from network_requirement import ParallelismConfig
 from operators.attention import PrefillAttention
 from operators.composite import (
     Repeat,
@@ -17,6 +18,9 @@ from workload_context import (
     Workload,
     WorkloadContext,
 )
+
+
+PAR = ParallelismConfig()
 
 
 # A100-style synthetic spec — only ridge_flops_per_byte affects is_compute_bound.
@@ -77,7 +81,7 @@ def test_llama3_8b_prefill_total_flops():
     batch, prompt_len = 1, 2048
     ctx = _prefill_ctx(batch, prompt_len)
 
-    total_flops = sum(op.compute_flops(ctx) for op in expand_layers(_llama3_8b_layers()))
+    total_flops = sum(op.compute_flops(ctx, PAR) for op in expand_layers(_llama3_8b_layers()))
 
     expected_flops = 2.0 * LLAMA3_8B_PARAMS * batch * prompt_len
     rel_err = abs(total_flops - expected_flops) / expected_flops
@@ -96,10 +100,10 @@ def test_prefill_attention_is_memory_bound():
         dtype_bytes=LLAMA3_8B.dtype_bytes,
     )
     ctx = _prefill_ctx(batch=1, prompt_len=2048)
-    assert not attn.is_compute_bound(ctx, A100)
+    assert not attn.is_compute_bound(ctx, A100, PAR)
 
     # Sanity-check the analytical AI: 2 * b / (3 * dtype_bytes), well below the ridge.
-    ai = attn.compute_flops(ctx) / attn.memory_bytes(ctx)
+    ai = attn.compute_flops(ctx, PAR) / attn.memory_bytes(ctx, PAR)
     expected_ai = 2.0 * LLAMA3_8B.flash_block_size / (3.0 * LLAMA3_8B.dtype_bytes)
     assert ai == pytest.approx(expected_ai)
     assert ai < A100.ridge_flops_per_byte
@@ -114,7 +118,7 @@ def test_qkv_gemm_is_compute_bound_at_prompt_2048():
         dtype_bytes=LLAMA3_8B.dtype_bytes,
     )
     ctx = _prefill_ctx(batch=1, prompt_len=2048)
-    assert qkv.is_compute_bound(ctx, A100)
+    assert qkv.is_compute_bound(ctx, A100, PAR)
     # And the ridge boundary: at very small M (single decode token) the same
     # GEMM flips memory-bound.
     decode_qkv = Gemm(
@@ -131,4 +135,4 @@ def test_qkv_gemm_is_compute_bound_at_prompt_2048():
         response_len=128,
         num_microbatches=1,
     )
-    assert not decode_qkv.is_compute_bound(decode_ctx, A100)
+    assert not decode_qkv.is_compute_bound(decode_ctx, A100, PAR)

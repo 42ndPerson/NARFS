@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from mesh import Mesh
-from model import Model
 from model_mapping import ModelMapping, SimulationResult
 from network_requirement import ParallelismConfig
 from operator_base import Operator
@@ -176,11 +175,10 @@ def shard_grid(
 
 
 def build_model_mapping(scenario: Scenario) -> tuple[ModelMapping, HostTopo]:
-    model = Model(
+    model = scenario.model_class(
         name=scenario.name,
         role="actor",
         architecture=scenario.architecture,
-        build_pattern=scenario.build_pattern,
     )
     num_hosts, coords = shard_grid(scenario.parallelism)
     shards: list[Shard] = []

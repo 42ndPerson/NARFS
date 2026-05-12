@@ -20,7 +20,6 @@ import pytest
 
 from hardware import HardwareSpec
 from mesh import Mesh
-from model import Model
 from model_mapping import ModelMapping
 from network_op import (
     AllReduceRing,
@@ -35,7 +34,7 @@ from network_requirement import (
     ParallelismConfig,
     ParallelismGroup,
 )
-from operators.llama_builder import build_llama_pattern
+from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import Relation
 from shard import Shard
@@ -97,11 +96,10 @@ def _shared_spine_topo(num_hosts: int, bw_gbps: float = 100.0) -> HostTopo:
 
 
 def _make_mapping(parallelism: ParallelismConfig) -> ModelMapping:
-    model = Model(
+    model = LlamaModel(
         name="phase1",
         role="actor",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
     shards: dict[Shard, Device] = {}
     d2s: dict[Device, Shard] = {}

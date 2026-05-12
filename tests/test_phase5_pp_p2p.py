@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from hardware import HardwareSpec
 from mesh import Mesh
-from model import Model
 from model_mapping import ModelMapping
 from network_op import P2P
 from network_requirement import (
@@ -25,7 +24,7 @@ from network_requirement import (
     ParallelismConfig,
     ParallelismGroup,
 )
-from operators.llama_builder import build_llama_pattern
+from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import NetworkPhase
 from shard import Shard
@@ -67,11 +66,10 @@ def _make_topo(num_hosts: int, spine_bw_gbps: float = 100.0) -> HostTopo:
     return HostTopo(device_connections=connections)
 
 
-def _make_model() -> Model:
-    return Model(
+def _make_model() -> LlamaModel:
+    return LlamaModel(
         name="llama_pp", role="actor",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
 
 

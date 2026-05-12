@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from hardware import HardwareSpec
+from network_requirement import ParallelismConfig
 from operator_base import Operator
 from workload_context import WorkloadContext
 
@@ -28,14 +29,19 @@ class AdamOptimizerOp(Operator):
     dtype_bytes_param: int = 2
     dtype_bytes_state: int = 4
 
-    def compute_flops(self, ctx: WorkloadContext) -> float:
+    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
+        del ctx, par
         return 8.0 * self.num_parameters
 
-    def memory_bytes(self, ctx: WorkloadContext) -> float:
+    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
+        del ctx, par
         return float(
             (2 * self.dtype_bytes_param + 3 * self.dtype_bytes_state)
             * self.num_parameters
         )
 
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+    def is_compute_bound(
+        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
+    ) -> bool:
+        del ctx, hw, par
         return False

@@ -10,12 +10,16 @@ from __future__ import annotations
 import pytest
 
 from hardware import HardwareSpec
+from network_requirement import ParallelismConfig
 from operators.gemm import Gemm
 from workload_context import (
     TokenCount,
     Workload,
     WorkloadContext,
 )
+
+
+PAR = ParallelismConfig()
 
 
 A100 = HardwareSpec(
@@ -96,6 +100,8 @@ def test_operators_size_off_microbatch_size_not_batch_size():
     )
 
     qkv = Gemm(n=12288, k=4096, token_count=TokenCount.PREFILL, dtype_bytes=2)
-    assert qkv.compute_flops(ctx_small) == qkv.compute_flops(ctx_big)
-    assert qkv.memory_bytes(ctx_small) == qkv.memory_bytes(ctx_big)
-    assert qkv.kernel_time(ctx_small, A100) == pytest.approx(qkv.kernel_time(ctx_big, A100))
+    assert qkv.compute_flops(ctx_small, PAR) == qkv.compute_flops(ctx_big, PAR)
+    assert qkv.memory_bytes(ctx_small, PAR) == qkv.memory_bytes(ctx_big, PAR)
+    assert qkv.kernel_time(ctx_small, A100, PAR) == pytest.approx(
+        qkv.kernel_time(ctx_big, A100, PAR)
+    )

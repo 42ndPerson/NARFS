@@ -1,7 +1,8 @@
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Callable, Optional
 
-from model import ArchitectureConfig
+from model import ArchitectureConfig, Model
 from network_requirement import (
     CollectiveKind,
     NetworkRequirement,
@@ -12,7 +13,7 @@ from operator_base import Operator
 from operators.builders import (
     OperatorWithReqs,
     PatternEntry,
-    TaggedRepeat,
+    LayerRepeat,
 )
 from operators.elementwise import RMSNorm, SwiGLUActivation
 from operators.embed import TokenEmbedding
@@ -24,8 +25,14 @@ from operators.moe import (
     build_moe_ffn,
 )
 from operators.v3_config import V3Config
+from parallelism_role import ParallelismRole, TPMode
 from relation import Relation
 from workload_context import TokenCount, WorkloadContext
+
+
+_COL = ParallelismRole(tp=TPMode.COLUMN_PARALLEL)
+_ROW = ParallelismRole(tp=TPMode.ROW_PARALLEL)
+_VOCAB = ParallelismRole(tp=TPMode.VOCAB_PARALLEL)
 
 
 def _phase_to_token_count(phase) -> TokenCount:
@@ -48,22 +55,14 @@ def _activation_size_fn(h: int, dtype_bytes: int, tc: TokenCount):
 
 
 def _ep_dispatched_size_fn(h: int, dtype_bytes: int, top_k: int, tc: TokenCount):
-    """Closure for MoE dispatch/combine: top_k * T * h * dtype_bytes / 1e9.
-
-    Each token is replicated `top_k` times, each copy traveling to a
-    different EP rank. Combine returns post-experts with the same shape.
-    """
+    """Closure for MoE dispatch/combine: top_k * T * h * dtype_bytes / 1e9."""
     def _fn(ctx) -> float:
         return top_k * tc.resolve(ctx) * h * dtype_bytes / 1e9
     return _fn
 
 
 def _lm_head_gather_size_fn(vocab: int, dtype_bytes: int, tc: TokenCount):
-    """Closure for LM-head AllGather: T * vocab * dtype_bytes / 1e9.
-
-    Each TP rank computes logits for vocab/tp slice; AllGather collects
-    all slices so every rank ends up with full [T, vocab].
-    """
+    """Closure for LM-head AllGather: T * vocab * dtype_bytes / 1e9."""
     def _fn(ctx) -> float:
         return tc.resolve(ctx) * vocab * dtype_bytes / 1e9
     return _fn
@@ -75,7 +74,6 @@ def _tp_all_reduce(cfg: V3Config, tc: TokenCount) -> NetworkRequirement:
         relation=Relation.EXCLUSIVE,
         eta=1.0,
         group=ParallelismGroup.TP,
-        # Reduces hidden-state activation [batch, seq, h] across TP ranks.
         data_GB_fn=_activation_size_fn(cfg.h, cfg.dtype_bytes, tc),
     )
 
@@ -86,7 +84,6 @@ def _ep_dispatch(cfg: V3Config, tc: TokenCount) -> NetworkRequirement:
         relation=Relation.EXCLUSIVE,
         eta=1.0,
         group=ParallelismGroup.EP,
-        # MoE dispatch: each token replicated top_k times, dispatched to top_k EP ranks.
         data_GB_fn=_ep_dispatched_size_fn(cfg.h, cfg.dtype_bytes, cfg.top_k, tc),
     )
 
@@ -97,7 +94,6 @@ def _ep_combine(cfg: V3Config, tc: TokenCount) -> NetworkRequirement:
         relation=Relation.EXCLUSIVE,
         eta=1.0,
         group=ParallelismGroup.EP,
-        # MoE combine: same shape as dispatch — post-expert outputs return.
         data_GB_fn=_ep_dispatched_size_fn(cfg.h, cfg.dtype_bytes, cfg.top_k, tc),
     )
 
@@ -112,15 +108,11 @@ def _lm_head_all_gather(cfg: V3Config, tc: TokenCount) -> NetworkRequirement:
     )
 
 
-def _dp_grad_all_reduce(ops: list[Operator], payload_tag: str) -> NetworkRequirement:
-    """DP gradient AllReduce sized to the per-rank parameter byte count.
-
-    See `llama_builder._dp_grad_all_reduce` for design rationale; the
-    `payload_tag` discriminates dense-layer vs MoE-layer templates so the
-    NetworkRequirement-dedup machinery doesn't collapse their distinct
-    parameter sizes (V3 MoE layer ≈ 256 expert sets vs dense's single FFN).
-    """
-    total_GB = sum(op.parameter_bytes() for op in ops) / 1e9
+def _dp_grad_all_reduce(
+    ops: list[Operator], parallelism: ParallelismConfig, payload_tag: str
+) -> NetworkRequirement:
+    """DP gradient AllReduce sized to the per-rank parameter byte count."""
+    total_GB = sum(op.parameter_bytes_per_rank(parallelism) for op in ops) / 1e9
     return NetworkRequirement(
         kind=CollectiveKind.ALL_REDUCE,
         relation=Relation.EXCLUSIVE,
@@ -132,20 +124,22 @@ def _dp_grad_all_reduce(ops: list[Operator], payload_tag: str) -> NetworkRequire
 
 
 def _derive_t_for(phase: TokenCount) -> Callable[[WorkloadContext], float]:
-    # Per-invocation token count; size off microbatch_size (not batch_size).
     if phase is TokenCount.PREFILL:
         return lambda ctx: float(ctx.microbatch_size * ctx.prompt_len)
     return lambda ctx: float(ctx.microbatch_size)
 
 
-def _dense_ffn(cfg: V3Config, phase: TokenCount, m_dense_local: int) -> list[Operator]:
+def _dense_ffn(cfg: V3Config, phase: TokenCount) -> list[Operator]:
+    """Dense FFN with column/row TP roles along the intermediate dim."""
     return [
-        Gemm(n=m_dense_local, k=cfg.h, token_count=phase, dtype_bytes=cfg.dtype_bytes),
-        Gemm(n=m_dense_local, k=cfg.h, token_count=phase, dtype_bytes=cfg.dtype_bytes),
-        SwiGLUActivation(
-            intermediate_size=m_dense_local, token_count=phase, dtype_bytes=cfg.dtype_bytes
-        ),
-        Gemm(n=cfg.h, k=m_dense_local, token_count=phase, dtype_bytes=cfg.dtype_bytes),
+        Gemm(n=cfg.m_dense, k=cfg.h, token_count=phase, dtype_bytes=cfg.dtype_bytes,
+             parallelism_role=_COL),
+        Gemm(n=cfg.m_dense, k=cfg.h, token_count=phase, dtype_bytes=cfg.dtype_bytes,
+             parallelism_role=_COL),
+        SwiGLUActivation(intermediate_size=cfg.m_dense, token_count=phase,
+                         dtype_bytes=cfg.dtype_bytes, parallelism_role=_COL),
+        Gemm(n=cfg.h, k=cfg.m_dense, token_count=phase, dtype_bytes=cfg.dtype_bytes,
+             parallelism_role=_ROW),
     ]
 
 
@@ -154,21 +148,19 @@ def build_v3_dense_layer(
     phase,
     parallelism: Optional[ParallelismConfig] = None,
 ) -> list[OperatorWithReqs]:
-    """One V3 dense decoder layer with TP-sharded MLA heads and FFN intermediate."""
+    """One V3 dense decoder layer with full-model shapes + TP roles."""
     parallelism = parallelism or ParallelismConfig()
     tp = parallelism.tp
-    if cfg.m_dense % tp != 0:
+    if tp > 1 and cfg.m_dense % tp != 0:
         raise ValueError(f"m_dense ({cfg.m_dense}) must be divisible by tp ({tp})")
-    m_dense_local = cfg.m_dense // tp
 
     tc = _phase_to_token_count(phase)
     mla = build_mla_prefill(cfg, tp) if tc is TokenCount.PREFILL else build_mla_decode(cfg, tp)
-    ffn = _dense_ffn(cfg, tc, m_dense_local)
+    ffn = _dense_ffn(cfg, tc)
 
     no_req: list[NetworkRequirement] = []
-    ar = [_tp_all_reduce(cfg, tc)] if parallelism.tp > 1 else no_req
+    ar = [_tp_all_reduce(cfg, tc)] if tp > 1 else no_req
 
-    # Layer order: pre-attn-norm, *MLA (last MLA op = attn_out), pre-ffn-norm, *FFN (last = ffn_down)
     out: list[OperatorWithReqs] = [
         (RMSNorm(hidden_size=cfg.h, token_count=tc, dtype_bytes=cfg.dtype_bytes), no_req),
     ]
@@ -180,9 +172,10 @@ def build_v3_dense_layer(
         is_ffn_down = i == len(ffn) - 1
         out.append((op, ar if is_ffn_down else no_req))
 
-    # Phase 4: per-layer DP gradient AllReduce in training when dp > 1.
     if phase == "training" and parallelism.dp > 1:
-        dp_ar = _dp_grad_all_reduce([op for op, _ in out], "v3_dense_layer")
+        dp_ar = _dp_grad_all_reduce(
+            [op for op, _ in out], parallelism, "v3_dense_layer"
+        )
         last_op, last_reqs = out[-1]
         out[-1] = (last_op, last_reqs + [dp_ar])
     return out
@@ -196,17 +189,16 @@ def build_v3_moe_layer(
     """One V3 MoE decoder layer.
 
     TP shards: MLA heads, shared-expert intermediate. Routed experts are
-    EP-sharded only — their per-expert intermediate stays at full `m_expert`.
+    EP-sharded only (their per-expert intermediate stays at full `m_expert`).
     """
     parallelism = parallelism or ParallelismConfig()
     tp = parallelism.tp
-    if cfg.m_expert % tp != 0:
+    if tp > 1 and cfg.m_expert % tp != 0:
         raise ValueError(f"m_expert ({cfg.m_expert}) must be divisible by tp ({tp})")
-    m_expert_shared_local = cfg.m_expert // tp
 
     tc = _phase_to_token_count(phase)
     mla = build_mla_prefill(cfg, tp) if tc is TokenCount.PREFILL else build_mla_decode(cfg, tp)
-    moe = build_moe_ffn(cfg, _derive_t_for(tc), m_expert_shared_local=m_expert_shared_local)
+    moe = build_moe_ffn(cfg, _derive_t_for(tc))
 
     no_req: list[NetworkRequirement] = []
     ar = [_tp_all_reduce(cfg, tc)] if parallelism.tp > 1 else no_req
@@ -230,15 +222,15 @@ def build_v3_moe_layer(
         elif isinstance(op, CombineMarker):
             reqs = combine
         elif i == last_idx:
-            # shared_down — emits TP AR (matches dense FFN behavior).
             reqs = ar
         else:
             reqs = no_req
         out.append((op, reqs))
 
-    # Phase 4: per-layer DP gradient AllReduce in training when dp > 1.
     if phase == "training" and parallelism.dp > 1:
-        dp_ar = _dp_grad_all_reduce([op for op, _ in out], "v3_moe_layer")
+        dp_ar = _dp_grad_all_reduce(
+            [op for op, _ in out], parallelism, "v3_moe_layer"
+        )
         last_op, last_reqs = out[-1]
         out[-1] = (last_op, last_reqs + [dp_ar])
     return out
@@ -249,31 +241,27 @@ def build_v3_model(
     phase,
     parallelism: Optional[ParallelismConfig] = None,
 ) -> list[PatternEntry]:
-    """Full V3 model graph: embed, dense layers, MoE layers, final norm, LM head.
-
-    LM head is TP-sharded along vocab; AllGather collects logits across TP
-    ranks when tp > 1.
-    """
+    """Full V3 model graph: embed, dense layers, MoE layers, final norm, LM head."""
     parallelism = parallelism or ParallelismConfig()
     tp = parallelism.tp
-    if cfg.vocab % tp != 0:
+    if tp > 1 and cfg.vocab % tp != 0:
         raise ValueError(f"vocab ({cfg.vocab}) must be divisible by tp ({tp})")
-    vocab_local = cfg.vocab // tp
 
     tc = _phase_to_token_count(phase)
-    # Pass the original `phase` (not the resolved TokenCount) so the layer
-    # builders can recognize "training" for Phase 4's DP-AR guard.
     dense = build_v3_dense_layer(cfg, phase, parallelism)
     moe = build_v3_moe_layer(cfg, phase, parallelism)
     lm_head_reqs: list[NetworkRequirement] = (
         [_lm_head_all_gather(cfg, tc)] if tp > 1 else []
     )
     return [
+        # Embedding is replicated across TP.
         (TokenEmbedding(vocab=cfg.vocab, h=cfg.h, token_count=tc, dtype_bytes=cfg.dtype_bytes), []),
-        TaggedRepeat(cfg.n_dense_layers, dense),
-        TaggedRepeat(cfg.n_layers - cfg.n_dense_layers, moe),
+        LayerRepeat(cfg.n_dense_layers, dense),
+        LayerRepeat(cfg.n_layers - cfg.n_dense_layers, moe),
         (RMSNorm(hidden_size=cfg.h, token_count=tc, dtype_bytes=cfg.dtype_bytes), []),
-        (Gemm(n=vocab_local, k=cfg.h, token_count=tc, dtype_bytes=cfg.dtype_bytes), lm_head_reqs),
+        # LM head: vocab-parallel — splits N along the vocab dim.
+        (Gemm(n=cfg.vocab, k=cfg.h, token_count=tc, dtype_bytes=cfg.dtype_bytes,
+              parallelism_role=_VOCAB), lm_head_reqs),
     ]
 
 
@@ -282,7 +270,22 @@ def build_v3_pattern(
     phase: str,
     parallelism: ParallelismConfig,
 ) -> list[PatternEntry]:
-    """Adapter matching the BuildPatternFn signature."""
+    """Standalone pattern builder for V3 models. Used as the underlying
+    implementation for `V3Model.forward_sequence`, and directly by tests
+    that need to inspect V3 patterns without going through ModelMapping.
+    """
     if not isinstance(arch, V3Config):
         raise TypeError(f"build_v3_pattern requires V3Config, got {type(arch).__name__}")
     return build_v3_model(arch, phase, parallelism)
+
+
+@dataclass(frozen=True)
+class V3Model(Model):
+    """DeepSeek-V3-style decoder with MLA + dense + MoE layers. Architecture
+    must be a `V3Config`.
+    """
+
+    def forward_sequence(
+        self, phase: str, parallelism: ParallelismConfig
+    ) -> list[PatternEntry]:
+        return build_v3_pattern(self.architecture, phase, parallelism)

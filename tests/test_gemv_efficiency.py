@@ -14,12 +14,16 @@ from __future__ import annotations
 import pytest
 
 from hardware import HardwareSpec
+from network_requirement import ParallelismConfig
 from operators.gemm import Gemm
 from workload_context import (
     TokenCount,
     Workload,
     WorkloadContext,
 )
+
+
+PAR = ParallelismConfig()
 
 
 A100 = HardwareSpec(
@@ -56,8 +60,8 @@ def test_gemv_uses_gemv_efficiency_factors():
     decode_qkv = Gemm(n=12288, k=4096, token_count=TokenCount.DECODE, dtype_bytes=2)
     ctx = _decode_ctx(microbatch=1)
     assert decode_qkv.is_gemv(ctx)
-    assert decode_qkv.compute_efficiency_factor(ctx, A100) == A100.gemv_efficiency
-    assert decode_qkv.memory_efficiency_factor(ctx, A100) == A100.gemv_memory_efficiency
+    assert decode_qkv.compute_efficiency_factor(ctx, A100, PAR) == A100.gemv_efficiency
+    assert decode_qkv.memory_efficiency_factor(ctx, A100, PAR) == A100.gemv_memory_efficiency
 
 
 def test_compute_bound_gemm_uses_compute_efficiency():
@@ -65,9 +69,9 @@ def test_compute_bound_gemm_uses_compute_efficiency():
     qkv = Gemm(n=12288, k=4096, token_count=TokenCount.PREFILL, dtype_bytes=2)
     ctx = _prefill_ctx(microbatch=4)
     assert not qkv.is_gemv(ctx)
-    assert not qkv.is_small_dim(ctx)
-    assert qkv.compute_efficiency_factor(ctx, A100) == A100.compute_efficiency
-    assert qkv.memory_efficiency_factor(ctx, A100) == A100.memory_efficiency
+    assert not qkv.is_small_dim(ctx, PAR)
+    assert qkv.compute_efficiency_factor(ctx, A100, PAR) == A100.compute_efficiency
+    assert qkv.memory_efficiency_factor(ctx, A100, PAR) == A100.memory_efficiency
 
 
 def test_small_dim_gemm_uses_small_gemm_efficiency():
@@ -84,10 +88,10 @@ def test_small_dim_gemm_uses_small_gemm_efficiency():
     # M = 1 * 512 = 512, which is < 1024 → small_dim. Note M < 16 would be
     # GEMV; M=512 is small_dim but not GEMV. (Pick a microbatch that keeps M
     # ≥ 16 but min(M,N,K) < 1024.)
-    assert op.is_small_dim(ctx)
+    assert op.is_small_dim(ctx, PAR)
     assert not op.is_gemv(ctx)
-    assert op.compute_efficiency_factor(ctx, A100) == A100.small_gemm_efficiency
-    assert op.memory_efficiency_factor(ctx, A100) == A100.memory_efficiency
+    assert op.compute_efficiency_factor(ctx, A100, PAR) == A100.small_gemm_efficiency
+    assert op.memory_efficiency_factor(ctx, A100, PAR) == A100.memory_efficiency
 
 
 def test_gemv_takes_precedence_over_small_dim():
@@ -96,8 +100,8 @@ def test_gemv_takes_precedence_over_small_dim():
     op = Gemm(n=512, k=512, token_count=TokenCount.DECODE, dtype_bytes=2)
     ctx = _decode_ctx(microbatch=1)
     assert op.is_gemv(ctx)
-    assert op.is_small_dim(ctx)  # both true
-    assert op.compute_efficiency_factor(ctx, A100) == A100.gemv_efficiency  # GEMV wins
+    assert op.is_small_dim(ctx, PAR)  # both true
+    assert op.compute_efficiency_factor(ctx, A100, PAR) == A100.gemv_efficiency  # GEMV wins
 
 
 def test_compute_time_uses_selected_efficiency():
@@ -110,9 +114,9 @@ def test_compute_time_uses_selected_efficiency():
 
     # Same flops/byte structure differs only by M; ratio of compute_times equals
     # M_ratio × (efficiency_compute / efficiency_gemv).
-    flops_decode = decode_op.compute_flops(decode_ctx)
-    flops_prefill = prefill_op.compute_flops(prefill_ctx)
+    flops_decode = decode_op.compute_flops(decode_ctx, PAR)
+    flops_prefill = prefill_op.compute_flops(prefill_ctx, PAR)
     expected_decode_time = flops_decode / (A100.peak_compute_flops * A100.gemv_efficiency)
     expected_prefill_time = flops_prefill / (A100.peak_compute_flops * A100.compute_efficiency)
-    assert decode_op.compute_time(decode_ctx, A100) == pytest.approx(expected_decode_time)
-    assert prefill_op.compute_time(prefill_ctx, A100) == pytest.approx(expected_prefill_time)
+    assert decode_op.compute_time(decode_ctx, A100, PAR) == pytest.approx(expected_decode_time)
+    assert prefill_op.compute_time(prefill_ctx, A100, PAR) == pytest.approx(expected_prefill_time)

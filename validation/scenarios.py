@@ -14,15 +14,14 @@ explicitly calls out a "sanity bound" rather than a tight target.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Callable
 
 from hardware import HardwareSpec
 from model import ArchitectureConfig
 from network_requirement import ParallelismConfig
-from operators.builders import PatternEntry
-from operators.llama_builder import build_llama_pattern
+from model import Model
+from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
-from operators.v3_block import build_v3_pattern
+from operators.v3_block import V3Model
 from operators.v3_config import V3Config
 from workload_context import Workload, WorkloadContext
 
@@ -95,7 +94,7 @@ class Scenario:
     name: str
     description: str
     architecture: ArchitectureConfig
-    build_pattern: Callable[..., list[PatternEntry]]
+    model_class: type[Model]
     parallelism: ParallelismConfig
     hardware: HardwareSpec
     workload: Workload
@@ -126,7 +125,7 @@ SCENARIOS: list[Scenario] = [
         name="llama2_7b_prefill_a100",
         description="Llama-2-7B prefill, batch=1, prompt=512, single A100-80GB. Reference ~50ms (vLLM).",
         architecture=LLAMA2_7B,
-        build_pattern=build_llama_pattern,
+        model_class=LlamaModel,
         parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=1),
         hardware=A100_80GB,
         workload=Workload.PREPARATION,
@@ -144,7 +143,7 @@ SCENARIOS: list[Scenario] = [
         name="llama2_7b_decode_a100",
         description="Llama-2-7B decode, batch=1, single A100-80GB. Reference ~25ms/token (vLLM).",
         architecture=LLAMA2_7B,
-        build_pattern=build_llama_pattern,
+        model_class=LlamaModel,
         parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=1),
         hardware=A100_80GB,
         workload=Workload.GENERATION,
@@ -163,7 +162,7 @@ SCENARIOS: list[Scenario] = [
         name="llama3_70b_prefill_8xa100_tp8",
         description="Llama-3-70B prefill, batch=1, prompt=2048, 8xA100-80GB TP=8. Reference ~250ms.",
         architecture=LLAMA3_70B,
-        build_pattern=build_llama_pattern,
+        model_class=LlamaModel,
         parallelism=ParallelismConfig(tp=8, pp=1, dp=1, ep=1),
         hardware=A100_80GB,
         workload=Workload.PREPARATION,
@@ -184,7 +183,7 @@ SCENARIOS: list[Scenario] = [
             "8xA100-80GB TP=2 PP=2 DP=2. Reference ~3-5s (Megatron-class). Sanity bound."
         ),
         architecture=LLAMA3_8B,
-        build_pattern=build_llama_pattern,
+        model_class=LlamaModel,
         parallelism=ParallelismConfig(tp=2, pp=2, dp=2, ep=1),
         hardware=A100_80GB,
         workload=Workload.TRAINING,
@@ -207,7 +206,7 @@ SCENARIOS: list[Scenario] = [
         name="deepseek_v3_prefill_32xh100_ep32",
         description="DeepSeek-V3 prefill, batch=1, prompt=4096, 32xH100-80GB EP=32 TP=1 PP=1. Reference ~500ms (looser bound).",
         architecture=DEEPSEEK_V3,
-        build_pattern=build_v3_pattern,
+        model_class=V3Model,
         parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=32),
         hardware=H100_80GB,
         workload=Workload.PREPARATION,
@@ -236,7 +235,7 @@ SCENARIOS: list[Scenario] = [
             "lane). Reference ~250ms."
         ),
         architecture=LLAMA3_70B,
-        build_pattern=build_llama_pattern,
+        model_class=LlamaModel,
         parallelism=ParallelismConfig(tp=8, pp=1, dp=1, ep=1),
         hardware=A100_80GB,
         workload=Workload.PREPARATION,
@@ -260,7 +259,7 @@ SCENARIOS: list[Scenario] = [
             "TP=2 PP=2 DP=2. Reference ~3-5s sanity bound."
         ),
         architecture=LLAMA3_8B,
-        build_pattern=build_llama_pattern,
+        model_class=LlamaModel,
         parallelism=ParallelismConfig(tp=2, pp=2, dp=2, ep=1),
         hardware=A100_80GB,
         workload=Workload.TRAINING,
@@ -283,7 +282,7 @@ SCENARIOS: list[Scenario] = [
             "Reference ~500ms (looser bound)."
         ),
         architecture=DEEPSEEK_V3,
-        build_pattern=build_v3_pattern,
+        model_class=V3Model,
         parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=32),
         hardware=H100_80GB,
         workload=Workload.PREPARATION,

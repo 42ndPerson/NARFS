@@ -15,7 +15,6 @@ import pytest
 
 from hardware import HardwareSpec
 from mesh import Mesh
-from model import Model
 from model_mapping import ModelMapping
 from network_op import AllToAll, AllReduceRing
 from network_requirement import (
@@ -23,9 +22,9 @@ from network_requirement import (
     ParallelismConfig,
     ParallelismGroup,
 )
-from operators.llama_builder import build_llama_pattern
+from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
-from operators.v3_block import build_v3_pattern
+from operators.v3_block import V3Model
 from operators.v3_config import V3Config
 from shard import Shard
 from topo import Device
@@ -42,21 +41,19 @@ SMALL_LLAMA = LlamaConfig(
 )
 
 
-def _llama_model() -> Model:
-    return Model(
+def _llama_model() -> LlamaModel:
+    return LlamaModel(
         name="phase2",
         role="actor",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
 
 
-def _v3_model() -> Model:
-    return Model(
+def _v3_model() -> V3Model:
+    return V3Model(
         name="phase2_v3",
         role="actor",
         architecture=V3Config(),
-        build_pattern=build_v3_pattern,
     )
 
 

@@ -6,7 +6,6 @@ import pytest
 
 from hardware import HardwareSpec
 from mesh import Mesh
-from model import Model
 from model_mapping import ModelMapping
 from network_op import (
     LogicalTransfer,
@@ -17,7 +16,7 @@ from network_requirement import (
     CollectiveKind,
     ParallelismConfig,
 )
-from operators.llama_builder import build_llama_pattern
+from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import NetworkPhase
 from resharding import (
@@ -87,7 +86,7 @@ def _make_topo(num_hosts: int, spine_bw_gbps: float = 100.0, link_latency_ms: fl
 
 
 def _make_mapping(
-    model: Model,
+    model: LlamaModel,
     parallelism: ParallelismConfig,
     workload: Workload,
     host_ids: list[int],
@@ -137,11 +136,10 @@ def _ctx(batch: int = 1, prompt_len: int = 64, response_len: int = 0) -> Workloa
 
 
 def test_naive_p2p_resharding_byte_count_matches_full_model():
-    model = Model(
+    model = LlamaModel(
         name="llama_small",
         role="actor",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
     train_mm = _make_mapping(
         model,
@@ -178,11 +176,10 @@ def test_naive_p2p_resharding_byte_count_matches_full_model():
 
 
 def test_rlhf_iteration_sums_stages_and_boundary():
-    model = Model(
+    model = LlamaModel(
         name="llama_small",
         role="actor",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
     train_mm = _make_mapping(
         model,
@@ -220,17 +217,15 @@ def test_rlhf_iteration_sums_stages_and_boundary():
 
 
 def test_simulate_isolated_sums_actor_and_critic_in_same_submesh():
-    actor = Model(
+    actor = LlamaModel(
         name="actor",
         role="actor",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
-    critic = Model(
+    critic = LlamaModel(
         name="critic",
         role="critic",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
     actor_mm = _make_mapping(actor, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
     critic_mm = _make_mapping(critic, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
@@ -262,20 +257,18 @@ def test_simulate_isolated_sums_actor_and_critic_in_same_submesh():
 def test_simulate_stage_takes_max_over_disjoint_submeshes():
     # Two submeshes on disjoint hosts. Different host counts → different
     # parallelism shapes → different stage times → max is well-defined.
-    big = Model(
+    big = LlamaModel(
         name="big",
         role="actor",
         architecture=SMALL_LLAMA,
-        build_pattern=build_llama_pattern,
     )
-    small = Model(
+    small = LlamaModel(
         name="small",
         role="critic",
         architecture=LlamaConfig(
             h=256, n_layers=2, n_q=4, n_kv=2, head_size=64, m=1024,
             rope_dim=64, vocab=8000, dtype_bytes=2,
         ),
-        build_pattern=build_llama_pattern,
     )
     big_mm = _make_mapping(big, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
     small_mm = _make_mapping(small, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [2, 3])
@@ -320,8 +313,8 @@ def test_steady_contention_two_concurrent_submeshes_share_spine():
     # Both submeshes do TP-AR with the same data_GB through one shared spine.
     # When both run, the AR transfers contend; per-submesh wall time grows.
     arch = SMALL_LLAMA
-    model_a = Model(name="a", role="actor", architecture=arch, build_pattern=build_llama_pattern)
-    model_b = Model(name="b", role="critic", architecture=arch, build_pattern=build_llama_pattern)
+    model_a = LlamaModel(name="a", role="actor", architecture=arch)
+    model_b = LlamaModel(name="b", role="critic", architecture=arch)
 
     ar_estimate = {CollectiveKind.ALL_REDUCE: 0.01}  # 10 MB per AR — large vs spine
 
