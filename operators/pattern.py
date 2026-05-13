@@ -129,11 +129,24 @@ def expand_pattern_with_layers(
 
 
 def split_pattern(
-    expanded: list[OperatorWithReqs],
+    expanded: list,
 ) -> tuple[list[Operator], list[list[NetworkRequirement]]]:
-    """Split parallel lists out of a fully-expanded tagged pattern."""
-    ops: list[Operator] = [t[0] for t in expanded]
-    reqs: list[list[NetworkRequirement]] = [t[1] for t in expanded]
+    """Split parallel lists out of a fully-expanded pattern.
+
+    Polymorphic over entry type: `OperatorWithReqs` tuples unpack into
+    (op, reqs); `LabeledOp` entries yield (operator, empty reqs). Used by
+    tests inspecting both labeled (architecture-output) and decorated
+    (strategy-output) patterns.
+    """
+    ops: list[Operator] = []
+    reqs: list[list[NetworkRequirement]] = []
+    for item in expanded:
+        if isinstance(item, LabeledOp):
+            ops.append(item.operator)
+            reqs.append([])
+        else:
+            ops.append(item[0])
+            reqs.append(item[1])
     return ops, reqs
 
 

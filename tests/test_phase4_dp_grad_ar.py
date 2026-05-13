@@ -29,6 +29,7 @@ from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
+from strategies import MegatronStrategy
 
 
 SMALL_LLAMA = LlamaConfig(
@@ -38,16 +39,15 @@ SMALL_LLAMA = LlamaConfig(
 
 
 def _llama_pattern(phase: str, par: ParallelismConfig):
-    """Construct a LlamaModel and return its forward_sequence pattern."""
-    return LlamaModel(
-        name="t", role="actor", architecture=SMALL_LLAMA,
-    ).forward_sequence(phase, par)
+    """Return the MegatronStrategy-decorated pattern (with requirements)
+    for a SMALL_LLAMA at the given parallelism."""
+    model = LlamaModel(name="t", role="actor", architecture=SMALL_LLAMA)
+    return MegatronStrategy(par).decorated_pattern(model, phase)
 
 
 def _v3_pattern(cfg: V3Config, phase: str, par: ParallelismConfig):
-    return V3Model(
-        name="t", role="actor", architecture=cfg,
-    ).forward_sequence(phase, par)
+    model = V3Model(name="t", role="actor", architecture=cfg)
+    return MegatronStrategy(par).decorated_pattern(model, phase)
 
 
 def _dp_ar_reqs(reqs_list: list[list[NetworkRequirement]]) -> list[NetworkRequirement]:
@@ -109,23 +109,16 @@ def test_llama_dp_ar_dedupes_to_single_requirement():
 def test_llama_dp_ar_size_matches_layer_parameter_bytes():
     """data_GB_fn returns total layer param bytes in GB, ignoring ctx."""
     pattern = _llama_pattern("training", ParallelismConfig(tp=1, pp=1, dp=2))
-    ops, reqs = split_pattern(expand_tagged_pattern(pattern))
+    _, reqs = split_pattern(expand_tagged_pattern(pattern))
     dp_ar = _dp_ar_reqs(reqs)[0]
 
-    # Slice out one layer's ops. The pattern is: embed, *layer1, *layer2,
-    # ..., final_norm, lm_head. Each layer is the same fixed length.
-    # We don't need a precise slice — sum a single layer's params by
-    # taking total_params / n_layers and comparing within tolerance.
-    # Reasoning: layer ops dominate; embed + final_norm + lm_head are
-    # tracked separately and not in the AR sum.
-    layer_size = 1 + ops.index([o for o in ops if o.parameter_bytes() > 0][1])  # stub
-    # Easier path: build one layer directly and sum.
     from operators.llama_builder import build_llama_layer
-    one_layer = build_llama_layer(SMALL_LLAMA, "training", ParallelismConfig(tp=1, pp=1, dp=2))
-    expected_GB = sum(op.parameter_bytes() for op, _ in one_layer) / 1e9
+    one_layer = build_llama_layer(SMALL_LLAMA, "training")
+    # build_llama_layer emits LabeledOps; sum their underlying operators'
+    # parameter bytes. At tp=1/dp=2, per-rank == full bytes.
+    expected_GB = sum(lop.operator.parameter_bytes() for lop in one_layer) / 1e9
     actual_GB = dp_ar.data_GB_fn(None)
     assert abs(actual_GB - expected_GB) < 1e-12
-    assert layer_size > 0  # silence unused warning
 
 
 # ---- V3: dense and MoE templates have distinct payload_ids ------------------
@@ -175,9 +168,9 @@ def test_v3_moe_and_dense_dp_ar_have_distinct_sizes():
     by_payload: dict = {}
     for r in dp_ars:
         by_payload.setdefault(r.payload_id, r)
-    sizes = {pid: r.data_GB_fn(None) for pid, r in by_payload.items()}
-    dense_size = sizes[("dp_grad", "v3_dense_layer")]
-    moe_size = sizes[("dp_grad", "v3_moe_layer")]
+    assert len(by_payload) == 2
+    sizes = sorted(r.data_GB_fn(None) for r in by_payload.values())
+    dense_size, moe_size = sizes  # smaller is dense, larger is MoE
     assert moe_size > dense_size, (dense_size, moe_size)
     assert moe_size != dense_size
 

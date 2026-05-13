@@ -1,121 +1,101 @@
+"""MLA (Multi-head Latent Attention) operator sub-builders for V3.
+
+Emits the operator sequence for one MLA block (prefill or decode) without
+sharding decisions. The parallelism strategy decorates these with roles
+and collectives via labels.
+"""
 from __future__ import annotations
 
-from operator_base import Operator
 from operators.attention import DecodeAttention, PrefillAttention
 from operators.elementwise import RoPE
 from operators.gemm import Gemm
+from operators.pattern import LabeledOp
 from operators.v3_config import V3Config
-from parallelism_role import ParallelismRole, TPMode
 from workload_context import TokenCount
 
 
-_COL = ParallelismRole(tp=TPMode.COLUMN_PARALLEL)
-_ROW = ParallelismRole(tp=TPMode.ROW_PARALLEL)
-_HEADS = ParallelismRole(tp=TPMode.HEADS_PARALLEL)
-_REP = ParallelismRole()
+# Canonical MLA labels.
+MLA_Q_DOWN = "mla_q_down"
+MLA_Q_UP = "mla_q_up"
+MLA_KV_DOWN = "mla_kv_down"
+MLA_KV_UP = "mla_kv_up"
+MLA_ROPE = "mla_rope"
+MLA_ATTENTION = "mla_attention"
+MLA_ATTN_OUT = "mla_attn_out"
 
 
-def _mla_projections(cfg: V3Config, tc: TokenCount) -> list[Operator]:
+def _mla_projections(cfg: V3Config, tc: TokenCount) -> list[LabeledOp]:
     """The 4 MLA projection GEMMs + decoupled-RoPE op shared by prefill/decode.
 
-    Megatron-style TP roles:
-      - q_down: not sharded; output is the q-latent (replicated)
+    Megatron canonical sharding (applied by the strategy via labels):
+      - q_down: replicated; output is the q-latent
       - q_up:   column-parallel — N spans heads
-      - kv_down: not sharded; output is the kv-latent (replicated)
+      - kv_down: replicated; output is the kv-latent
       - kv_up:  column-parallel — N spans heads
       - rope:   heads-parallel
     """
     return [
-        Gemm(n=cfg.d_q_compress, k=cfg.h, token_count=tc, dtype_bytes=cfg.dtype_bytes,
-             parallelism_role=_REP),
-        Gemm(
+        LabeledOp(MLA_Q_DOWN, Gemm(
+            n=cfg.d_q_compress, k=cfg.h,
+            token_count=tc, dtype_bytes=cfg.dtype_bytes,
+        )),
+        LabeledOp(MLA_Q_UP, Gemm(
             n=cfg.n_h * (cfg.head_size + cfg.d_rope),
             k=cfg.d_q_compress,
-            token_count=tc,
-            dtype_bytes=cfg.dtype_bytes,
-            parallelism_role=_COL,
-        ),
-        Gemm(n=cfg.d_kv_compress + cfg.d_rope, k=cfg.h, token_count=tc,
-             dtype_bytes=cfg.dtype_bytes, parallelism_role=_REP),
-        Gemm(
+            token_count=tc, dtype_bytes=cfg.dtype_bytes,
+        )),
+        LabeledOp(MLA_KV_DOWN, Gemm(
+            n=cfg.d_kv_compress + cfg.d_rope, k=cfg.h,
+            token_count=tc, dtype_bytes=cfg.dtype_bytes,
+        )),
+        LabeledOp(MLA_KV_UP, Gemm(
             n=cfg.n_h * 2 * cfg.head_size,
             k=cfg.d_kv_compress,
-            token_count=tc,
-            dtype_bytes=cfg.dtype_bytes,
-            parallelism_role=_COL,
-        ),
-        RoPE(
-            num_heads=cfg.n_h,
-            head_size=cfg.head_size,
-            rope_dim=cfg.d_rope,
-            token_count=tc,
-            dtype_bytes=cfg.dtype_bytes,
-            parallelism_role=_HEADS,
-        ),
+            token_count=tc, dtype_bytes=cfg.dtype_bytes,
+        )),
+        LabeledOp(MLA_ROPE, RoPE(
+            num_heads=cfg.n_h, head_size=cfg.head_size, rope_dim=cfg.d_rope,
+            token_count=tc, dtype_bytes=cfg.dtype_bytes,
+        )),
     ]
 
 
-def build_mla_prefill(cfg: V3Config, tp: int = 1) -> list[Operator]:
+def build_mla_prefill(cfg: V3Config) -> list[LabeledOp]:
     """One MLA layer's operator sequence in prefill mode.
 
     Order: q_down, q_up, kv_down, kv_up, rope, attn_core, attn_out.
     """
-    if tp > 1 and cfg.n_h % tp != 0:
-        raise ValueError(f"n_h ({cfg.n_h}) must be divisible by tp ({tp})")
     tc = TokenCount.PREFILL
     ops = _mla_projections(cfg, tc)
-    ops.append(
-        PrefillAttention(
-            num_heads=cfg.n_h,
-            num_kv_heads=cfg.n_h,
-            head_size=cfg.head_size + cfg.d_rope,
-            flash_block_size=cfg.flash_block_size,
-            dtype_bytes=cfg.dtype_bytes,
-            parallelism_role=_HEADS,
-        )
-    )
-    # attn_out: row-parallel — input dim (n_h * head_size) is sharded.
-    ops.append(
-        Gemm(
-            n=cfg.h,
-            k=cfg.n_h * cfg.head_size,
-            token_count=tc,
-            dtype_bytes=cfg.dtype_bytes,
-            parallelism_role=_ROW,
-        )
-    )
+    ops.append(LabeledOp(MLA_ATTENTION, PrefillAttention(
+        num_heads=cfg.n_h, num_kv_heads=cfg.n_h,
+        head_size=cfg.head_size + cfg.d_rope,
+        flash_block_size=cfg.flash_block_size,
+        dtype_bytes=cfg.dtype_bytes,
+    )))
+    ops.append(LabeledOp(MLA_ATTN_OUT, Gemm(
+        n=cfg.h, k=cfg.n_h * cfg.head_size,
+        token_count=tc, dtype_bytes=cfg.dtype_bytes,
+    )))
     return ops
 
 
-def build_mla_decode(cfg: V3Config, tp: int = 1) -> list[Operator]:
+def build_mla_decode(cfg: V3Config) -> list[LabeledOp]:
     """One MLA layer in decode mode.
 
-    Same operator structure as prefill but decode-shaped tokens, and the key
-    difference: DecodeAttention's kv_bytes_per_token is overridden to the
-    MLA latent footprint (d_kv_compress + d_rope) * dtype_bytes — this is the
-    dominant memory win MLA buys at decode.
+    DecodeAttention's kv_bytes_per_token is overridden to the MLA latent
+    footprint — the dominant memory win MLA buys at decode.
     """
-    if tp > 1 and cfg.n_h % tp != 0:
-        raise ValueError(f"n_h ({cfg.n_h}) must be divisible by tp ({tp})")
     tc = TokenCount.DECODE
     ops = _mla_projections(cfg, tc)
-    ops.append(
-        DecodeAttention(
-            num_heads=cfg.n_h,
-            num_kv_heads=cfg.n_h,
-            head_size=cfg.head_size + cfg.d_rope,
-            dtype_bytes=cfg.dtype_bytes,
-            kv_bytes_per_token=(cfg.d_kv_compress + cfg.d_rope) * cfg.dtype_bytes,
-            parallelism_role=_HEADS,
-        )
-    )
-    ops.append(
-        Gemm(
-            n=cfg.h,
-            k=cfg.n_h * cfg.head_size,
-            token_count=tc,
-            dtype_bytes=cfg.dtype_bytes,
-            parallelism_role=_ROW,
-        )
-    )
+    ops.append(LabeledOp(MLA_ATTENTION, DecodeAttention(
+        num_heads=cfg.n_h, num_kv_heads=cfg.n_h,
+        head_size=cfg.head_size + cfg.d_rope,
+        dtype_bytes=cfg.dtype_bytes,
+        kv_bytes_per_token=(cfg.d_kv_compress + cfg.d_rope) * cfg.dtype_bytes,
+    )))
+    ops.append(LabeledOp(MLA_ATTN_OUT, Gemm(
+        n=cfg.h, k=cfg.n_h * cfg.head_size,
+        token_count=tc, dtype_bytes=cfg.dtype_bytes,
+    )))
     return ops

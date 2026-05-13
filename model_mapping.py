@@ -156,6 +156,12 @@ class ModelMapping:
     shards_to_devices: dict[Shard, Device]
     device_to_shard: dict[Device, Shard]
 
+    # Pre-decorated patterns from the strategy. `forward_pattern` is the
+    # primary sequence (used for PREPARATION/TRAINING and for GENERATION's
+    # prefill leg). `decode_pattern` is GENERATION's decode leg.
+    forward_pattern: list = field(default_factory=list)
+    decode_pattern: list = field(default_factory=list)
+
     # Computed in __post_init__:
     forward_seq: list[CombinedOp] = field(init=False, default_factory=list)
     decode_seq: list[CombinedOp] = field(init=False, default_factory=list)
@@ -172,12 +178,12 @@ class ModelMapping:
     def __post_init__(self) -> None:
         self._validate_axis_consistency()
         if self.workload is Workload.GENERATION:
-            self.forward_seq, self.pipeline_partition = self._build_seq_for_phase("prefill")
-            self.decode_seq, self.decode_pipeline_partition = self._build_seq_for_phase("decode")
+            self.forward_seq, self.pipeline_partition = self._build_seq_from_pattern(self.forward_pattern)
+            self.decode_seq, self.decode_pipeline_partition = self._build_seq_from_pattern(self.decode_pattern)
         elif self.workload is Workload.PREPARATION:
-            self.forward_seq, self.pipeline_partition = self._build_seq_for_phase("prefill")
+            self.forward_seq, self.pipeline_partition = self._build_seq_from_pattern(self.forward_pattern)
         elif self.workload is Workload.TRAINING:
-            self._build_training_seq()
+            self._build_training_seq_from_pattern()
         elif self.workload is Workload.DORMANT:
             pass
         else:
@@ -214,15 +220,21 @@ class ModelMapping:
 
     # ----- pattern build / install -------------------------------------------
 
-    def _build_seq_for_phase(self, phase: str) -> tuple[list[CombinedOp], list[list[int]]]:
-        pattern = self.model.forward_sequence(phase, self.parallelism)
+    def _build_seq_from_pattern(
+        self, pattern: list
+    ) -> tuple[list[CombinedOp], list[list[int]]]:
+        """Consume a strategy-decorated pattern, expand it, attach layer
+        tags, and turn it into a CombinedOp sequence + PP partition."""
         expanded = expand_pattern_with_layers(pattern)
         seq = self._expanded_to_seq(expanded)
         partition = self._layer_aware_partition(seq)
         return seq, partition
 
-    def _build_training_seq(self) -> None:
-        forward_pattern = self.model.forward_sequence("training", self.parallelism)
+    def _build_training_seq_from_pattern(self) -> None:
+        """Training: take the strategy-decorated forward pattern, derive
+        backward + per-layer Adam, then build the CombinedOp sequence.
+        """
+        forward_pattern = self.forward_pattern
         backward_pattern = derive_backward_pattern(forward_pattern, recompute=True)
 
         forward_expanded = expand_pattern_with_layers(forward_pattern)

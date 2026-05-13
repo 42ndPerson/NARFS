@@ -66,7 +66,10 @@ def test_v3_total_parameter_bytes():
 def test_mla_decode_kv_cache_per_token():
     cfg = V3Config()
     decode_ops = build_mla_decode(cfg)
-    decode_attn = next(op for op in decode_ops if isinstance(op, DecodeAttention))
+    # build_mla_decode emits LabeledOps; unwrap to find the attention op.
+    decode_attn = next(
+        lop.operator for lop in decode_ops if isinstance(lop.operator, DecodeAttention)
+    )
 
     expected_mla_kv = (cfg.d_kv_compress + cfg.d_rope) * cfg.dtype_bytes
     assert expected_mla_kv == 1152
