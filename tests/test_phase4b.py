@@ -5,8 +5,8 @@ import math
 import pytest
 
 from hardware import HardwareSpec
-from mesh import Mesh
 from model_mapping import ModelMapping
+from model_mapping_group import ModelMappingGroup
 from network_op import (
     LogicalTransfer,
     NetworkOp,
@@ -16,14 +16,13 @@ from network_requirement import ParallelismConfig
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import NetworkPhase
-from resharding import (
-    NaiveP2PStrategy,
-    llama_total_parameter_bytes,
-)
 from simulator import simulate_rlhf_iteration, simulate_stage
 from stages import RLHFTimeline, StageBoundary
-from strategies import MegatronStrategy
-from submesh_mapping import SubmeshMapping
+from strategies import (
+    MegatronStrategy,
+    MegatronToMegatronP2P,
+    llama_total_parameter_bytes,
+)
 from topo import Device, HostTopo, Link, Path
 from transition import StageTransition
 from workload_context import (
@@ -34,10 +33,6 @@ from workload_context import (
 
 def _dev(host: int) -> Device:
     return Device(host_id=host, gpu_id=0)
-
-
-def _mesh_for(host_ids: list[int]) -> Mesh:
-    return Mesh(devices=[_dev(h) for h in host_ids])
 
 
 # ---- shared fixtures ---------------------------------------------------------
@@ -169,9 +164,9 @@ def test_rlhf_iteration_sums_stages_and_boundary():
         Workload.GENERATION,
         host_ids=[2, 3],
     )
-    train_sm = SubmeshMapping(model_mappings=[train_mm], submesh=_mesh_for([0, 1]))
-    gen_sm = SubmeshMapping(model_mappings=[gen_mm], submesh=_mesh_for([2, 3]))
-    transition = StageTransition(source=train_mm, dest=gen_mm, strategy=NaiveP2PStrategy())
+    train_sm = ModelMappingGroup(model_mappings=[train_mm])
+    gen_sm = ModelMappingGroup(model_mappings=[gen_mm])
+    transition = StageTransition(source=train_mm, dest=gen_mm, strategy=MegatronToMegatronP2P())
     timeline = RLHFTimeline(
         stages=[[train_sm], [gen_sm]],
         boundaries=[StageBoundary(transitions=[transition])],
@@ -204,14 +199,14 @@ def test_simulate_isolated_sums_actor_and_critic_in_same_submesh():
     actor_mm = _make_mapping(actor, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
     critic_mm = _make_mapping(critic, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
 
-    submesh = SubmeshMapping(model_mappings=[actor_mm, critic_mm], submesh=_mesh_for([0, 1]))
+    submesh = ModelMappingGroup(model_mappings=[actor_mm, critic_mm])
     topo = _make_topo(num_hosts=2)
     ctx = _ctx()
 
     isolated_time = submesh.simulate_isolated(ctx, A100, topo)
 
-    actor_alone = SubmeshMapping(model_mappings=[actor_mm], submesh=_mesh_for([0, 1]))
-    critic_alone = SubmeshMapping(model_mappings=[critic_mm], submesh=_mesh_for([0, 1]))
+    actor_alone = ModelMappingGroup(model_mappings=[actor_mm])
+    critic_alone = ModelMappingGroup(model_mappings=[critic_mm])
     actor_time = actor_alone.simulate_isolated(ctx, A100, topo)
     critic_time = critic_alone.simulate_isolated(ctx, A100, topo)
 
@@ -250,12 +245,12 @@ def test_simulate_stage_takes_max_over_disjoint_submeshes():
     topo = _make_topo(num_hosts=4)
     ctx = _ctx(prompt_len=128)
 
-    big_only = simulate_stage([SubmeshMapping([big_mm], _mesh_for([0, 1]))], ctx, A100, topo)
-    small_only = simulate_stage([SubmeshMapping([small_mm], _mesh_for([2, 3]))], ctx, A100, topo)
+    big_only = simulate_stage([ModelMappingGroup([big_mm])], ctx, A100, topo)
+    small_only = simulate_stage([ModelMappingGroup([small_mm])], ctx, A100, topo)
     both = simulate_stage(
         [
-            SubmeshMapping([big_mm], _mesh_for([0, 1])),
-            SubmeshMapping([small_mm], _mesh_for([2, 3])),
+            ModelMappingGroup([big_mm]),
+            ModelMappingGroup([small_mm]),
         ],
         ctx, A100, topo,
     )
@@ -296,8 +291,8 @@ def test_steady_contention_two_concurrent_submeshes_share_spine():
     topo = _make_topo(num_hosts=4, spine_bw_gbps=1.0, link_latency_ms=0.0)
     ctx = _ctx(prompt_len=64)
 
-    sm_a = SubmeshMapping([mm_a], _mesh_for([0, 1]))
-    sm_b = SubmeshMapping([mm_b], _mesh_for([2, 3]))
+    sm_a = ModelMappingGroup([mm_a])
+    sm_b = ModelMappingGroup([mm_b])
 
     alone = simulate_stage([sm_a], ctx, A100, topo)
     together = simulate_stage([sm_a, sm_b], ctx, A100, topo)

@@ -26,13 +26,14 @@ for backwards compatibility.
 """
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from hardware import HardwareSpec
-from mesh import Mesh
 from model import Model
 from model_mapping import ModelMapping
+from network_op import NetworkOp, P2P
 from network_requirement import (
     CollectiveKind,
     NetworkRequirement,
@@ -567,7 +568,6 @@ def assemble(
     d2s = {dev: s for s, dev in s2d.items()}
     return ModelMapping(
         model=plan.model,
-        mesh=Mesh(devices=list(devices)),
         workload=plan.workload,
         parallelism=plan.parallelism,
         shards_to_devices=s2d,
@@ -577,6 +577,243 @@ def assemble(
     )
 
 
+# ---- resharding -------------------------------------------------------------
+#
+# A `ReshardingStrategy` converts a `(source_mapping, dest_mapping)` pair
+# into `NetworkOp`s that physically move parameter bytes from the source's
+# parallelism layout to the destination's. Resharding lives alongside the
+# parallelism schemes because the byte-movement pattern is determined by
+# how each side's scheme lays weights out across ranks — Megatron-to-
+# Megatron is the v1 case; HybridFlow's 3D HybridEngine wants its own
+# strategy that exploits micro-DP AllGather instead of P2P.
+
+
+@dataclass(frozen=True)
+class _ParameterTensor:
+    """A single weight tensor with the info needed to compute per-rank slices.
+
+    shard_axis:
+      0  → row-parallel (split rows across TP)
+      1  → column-parallel (split cols across TP)
+      None → fully replicated across TP
+    pp_anchor:
+      "first" → lives on PP rank 0 (embedding)
+      "last"  → lives on PP rank pp_size - 1 (LM head)
+      "layer" → derived from layer_id × pp_size // n_layers
+    """
+
+    name: str
+    shape: tuple[int, int]
+    dtype_bytes: int
+    layer_id: Optional[int] = None
+    shard_axis: Optional[int] = None
+    pp_anchor: str = "layer"
+
+
+def _llama_parameters(arch: LlamaConfig) -> list[_ParameterTensor]:
+    """Llama parameter list under the Megatron-style natural sharding scheme.
+
+    QKV column-parallel, attention output row-parallel, FFN gate/up
+    column-parallel, FFN down row-parallel, embedding+LM head vocab-parallel.
+    Norm scales (RMSNorm) are negligible and intentionally omitted; total
+    parameter accounting differs by O(n_layers · h) bytes.
+    """
+    out: list[_ParameterTensor] = []
+    out.append(_ParameterTensor(
+        name="embed",
+        shape=(arch.vocab, arch.h),
+        dtype_bytes=arch.dtype_bytes,
+        shard_axis=0,
+        pp_anchor="first",
+    ))
+    n_qkv = arch.n_q + 2 * arch.n_kv
+    for layer_id in range(arch.n_layers):
+        out.append(_ParameterTensor(
+            name=f"qkv_l{layer_id}",
+            shape=(n_qkv * arch.head_size, arch.h),
+            dtype_bytes=arch.dtype_bytes,
+            layer_id=layer_id, shard_axis=0, pp_anchor="layer",
+        ))
+        out.append(_ParameterTensor(
+            name=f"o_l{layer_id}",
+            shape=(arch.h, arch.n_q * arch.head_size),
+            dtype_bytes=arch.dtype_bytes,
+            layer_id=layer_id, shard_axis=1, pp_anchor="layer",
+        ))
+        out.append(_ParameterTensor(
+            name=f"gate_l{layer_id}",
+            shape=(arch.m, arch.h),
+            dtype_bytes=arch.dtype_bytes,
+            layer_id=layer_id, shard_axis=0, pp_anchor="layer",
+        ))
+        out.append(_ParameterTensor(
+            name=f"up_l{layer_id}",
+            shape=(arch.m, arch.h),
+            dtype_bytes=arch.dtype_bytes,
+            layer_id=layer_id, shard_axis=0, pp_anchor="layer",
+        ))
+        out.append(_ParameterTensor(
+            name=f"down_l{layer_id}",
+            shape=(arch.h, arch.m),
+            dtype_bytes=arch.dtype_bytes,
+            layer_id=layer_id, shard_axis=1, pp_anchor="layer",
+        ))
+    out.append(_ParameterTensor(
+        name="lm_head",
+        shape=(arch.vocab, arch.h),
+        dtype_bytes=arch.dtype_bytes,
+        shard_axis=0, pp_anchor="last",
+    ))
+    return out
+
+
+def _pp_rank_for(param: _ParameterTensor, pp_size: int, n_layers: int) -> int:
+    if param.pp_anchor == "first":
+        return 0
+    if param.pp_anchor == "last":
+        return pp_size - 1
+    if param.pp_anchor == "layer":
+        if param.layer_id is None:
+            raise ValueError(f"layer-anchored param {param.name} missing layer_id")
+        return (param.layer_id * pp_size) // n_layers
+    raise ValueError(f"Unknown pp_anchor: {param.pp_anchor!r}")
+
+
+def _shards_at(mapping: ModelMapping, dp: int, pp: int) -> dict[int, Shard]:
+    """Returns {tp_rank: Shard} for the given (dp, pp) coordinate."""
+    return {
+        s.tp: s
+        for s in mapping.shards_to_devices
+        if s.dp == dp and s.pp == pp
+    }
+
+
+def llama_total_parameter_bytes(arch: LlamaConfig) -> int:
+    """Sum of parameter bytes for a Llama model under the natural sharding scheme.
+
+    Exposed so tests can compare resharding bytes against the architectural
+    target. Mirrors `_llama_parameters`.
+    """
+    return sum(p.shape[0] * p.shape[1] * p.dtype_bytes for p in _llama_parameters(arch))
+
+
+class ReshardingStrategy(ABC):
+    """Computes the NetworkOps that physically move parameter bytes from one
+    parallelism layout to another. Concrete strategies are typically paired
+    with the schemes on both sides (e.g. `MegatronToMegatronP2P` between
+    two Megatron layouts; a future `HybridFlowMicroDPAllGather` for
+    HybridFlow's 3D HybridEngine resharding).
+    """
+
+    @abstractmethod
+    def compute_network_ops(
+        self, source: ModelMapping, dest: ModelMapping,
+    ) -> list[NetworkOp]:
+        ...
+
+
+class MegatronToMegatronP2P(ReshardingStrategy):
+    """Resharding between two Megatron layouts via per-host-pair P2P.
+
+    For each parameter tensor, computes (src_device, dst_device) byte
+    movements under the natural Megatron sharding scheme (QKV column-
+    parallel, O row-parallel, gate/up column-parallel, down row-parallel,
+    embed + LM head vocab-parallel), aggregates by device pair, and emits
+    one P2P per non-zero pair.
+
+    Treats DP as canonical (dp=0 source → dp=0 dest); a real implementation
+    would also broadcast to other DP replicas, but the extra fan-out is the
+    same parameter set replicated and orthogonal to the resharding cost
+    modeled here.
+
+    Currently supports only LlamaConfig models. V3 (with MoE expert
+    sharding) requires a separate enumeration and is left for a later phase.
+    """
+
+    def compute_network_ops(
+        self, source: ModelMapping, dest: ModelMapping,
+    ) -> list[NetworkOp]:
+        arch = source.model.architecture
+        if not isinstance(arch, LlamaConfig):
+            raise NotImplementedError(
+                "MegatronToMegatronP2P only supports LlamaConfig models in v1; "
+                "V3 / MoE resharding will need its own enumeration."
+            )
+
+        params = _llama_parameters(arch)
+        n_layers = arch.n_layers
+
+        agg: dict[tuple[Device, Device], int] = defaultdict(int)
+        for p in params:
+            for pair, bytes_moved in self._movements_for_param(
+                p, source, dest, n_layers
+            ).items():
+                agg[pair] += bytes_moved
+
+        ops: list[NetworkOp] = []
+        for (src_device, dst_device), bytes_total in agg.items():
+            if bytes_total <= 0:
+                continue
+            ops.append(P2P(
+                endpoint_pairs=[(src_device, dst_device)],
+                total_data_GB=bytes_total / 1e9,
+            ))
+        return ops
+
+    def _movements_for_param(
+        self,
+        param: _ParameterTensor,
+        source: ModelMapping,
+        dest: ModelMapping,
+        n_layers: int,
+    ) -> dict[tuple[Device, Device], int]:
+        src_pp = _pp_rank_for(param, source.parallelism.pp, n_layers)
+        dst_pp = _pp_rank_for(param, dest.parallelism.pp, n_layers)
+        src_shards = _shards_at(source, dp=0, pp=src_pp)
+        dst_shards = _shards_at(dest, dp=0, pp=dst_pp)
+        if not src_shards or not dst_shards:
+            return {}
+
+        rows, cols = param.shape
+        movements: dict[tuple[Device, Device], int] = defaultdict(int)
+
+        if param.shard_axis is None:
+            src_device = source.shards_to_devices[src_shards[0]]
+            dst_device = dest.shards_to_devices[dst_shards[0]]
+            movements[(src_device, dst_device)] = rows * cols * param.dtype_bytes
+            return movements
+
+        sharded_dim = param.shape[param.shard_axis]
+        other_dim = param.shape[1 - param.shard_axis]
+        src_tp = source.parallelism.tp
+        dst_tp = dest.parallelism.tp
+
+        if sharded_dim % src_tp != 0:
+            raise ValueError(
+                f"Param {param.name}: shard dim {sharded_dim} not divisible by "
+                f"source tp {src_tp}"
+            )
+        if sharded_dim % dst_tp != 0:
+            raise ValueError(
+                f"Param {param.name}: shard dim {sharded_dim} not divisible by "
+                f"dest tp {dst_tp}"
+            )
+        src_chunk = sharded_dim // src_tp
+        dst_chunk = sharded_dim // dst_tp
+
+        for src_t in range(src_tp):
+            src_lo, src_hi = src_t * src_chunk, (src_t + 1) * src_chunk
+            src_device = source.shards_to_devices[src_shards[src_t]]
+            for dst_t in range(dst_tp):
+                dst_lo, dst_hi = dst_t * dst_chunk, (dst_t + 1) * dst_chunk
+                overlap = max(0, min(src_hi, dst_hi) - max(src_lo, dst_lo))
+                if overlap == 0:
+                    continue
+                dst_device = dest.shards_to_devices[dst_shards[dst_t]]
+                movements[(src_device, dst_device)] += overlap * other_dim * param.dtype_bytes
+        return movements
+
+
 # ---- backward-compat aliases ------------------------------------------------
 
 # Callers that imported the previous `ParallelismStrategy` / `MegatronStrategy`
@@ -584,3 +821,5 @@ def assemble(
 # `MegatronScheme`.
 ParallelismStrategy = ParallelismScheme
 MegatronStrategy = MegatronScheme
+# Resharding alias (old `NaiveP2PStrategy` name).
+NaiveP2PStrategy = MegatronToMegatronP2P

@@ -33,7 +33,7 @@ from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import Relation
 from strategies import MegatronStrategy
-from submesh_mapping import resolve_op_transfers
+from model_mapping_group import resolve_op_transfers
 from topo import Device, HostTopo, Link, Path
 from workload_context import (
     TokenCount,
@@ -163,14 +163,14 @@ def test_tp_ar_time_scales_with_microbatch():
     """End-to-end: run simulate twice with microbatch 1 vs 2; the per-AR
     network time approximately doubles (modulo latency floor)."""
     from simulator import simulate_stage
-    from submesh_mapping import SubmeshMapping
+    from model_mapping_group import ModelMappingGroup
 
     mm = _make_mapping(ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
-    submesh = SubmeshMapping(model_mappings=[mm], submesh=mm.mesh)
+    group = ModelMappingGroup(model_mappings=[mm])
     topo = _shared_spine_topo(num_hosts=2, bw_gbps=10.0)
 
-    t1 = simulate_stage([submesh], _ctx(microbatch=1, prompt_len=512), A100, topo)
-    t2 = simulate_stage([submesh], _ctx(microbatch=2, prompt_len=512), A100, topo)
+    t1 = simulate_stage([group], _ctx(microbatch=1, prompt_len=512), A100, topo)
+    t2 = simulate_stage([group], _ctx(microbatch=2, prompt_len=512), A100, topo)
 
     assert t2 > t1, f"expected t2 > t1, got t1={t1:.6f} t2={t2:.6f}"
 

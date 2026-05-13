@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from hardware import HardwareSpec
-from mesh import Mesh
 from model import Model
 from network_op import (
     AllGatherRing,
@@ -155,7 +154,6 @@ class ModelMapping:
     """
 
     model: Model
-    mesh: Mesh
     workload: Workload
     parallelism: ParallelismConfig
     shards_to_devices: dict[Shard, Device]

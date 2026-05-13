@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from hardware import HardwareSpec
-from mesh import Mesh
 from model_mapping import ModelMapping
 from network_op import LogicalTransfer, NetworkOp
 from relation import NetworkPhase
@@ -63,9 +62,16 @@ def boundary_transfer_times(
 
 
 @dataclass
-class SubmeshMapping:
+class ModelMappingGroup:
+    """A set of `ModelMapping`s that share a slice of the cluster — typically
+    a stage's actor/critic/reward collocated on the same devices.
+
+    The group's device footprint is implicit in the union of the members'
+    `shards_to_devices` keys; no separate mesh field is carried because
+    nothing in the simulator needed to query a stand-alone mesh.
+    """
+
     model_mappings: list[ModelMapping]
-    submesh: Mesh
 
     def simulate_isolated(
         self,
@@ -73,10 +79,10 @@ class SubmeshMapping:
         hw: HardwareSpec,
         topo: HostTopo,
     ) -> float:
-        """Approximate single-submesh wall time.
+        """Approximate single-group wall time.
 
-        Cross-submesh contention is silently ignored — steady/boundary
-        snapshots are taken against only this submesh's own NetworkOps.
+        Cross-group contention is silently ignored — steady/boundary
+        snapshots are taken against only this group's own NetworkOps.
         Use `simulate_stage` when stage-wide context is available.
         """
         op_transfers = resolve_op_transfers(workload_ctx, self.model_mappings)

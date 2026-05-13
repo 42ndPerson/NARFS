@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from hardware import HardwareSpec
 from model_mapping import SimulationResult
 from stages import RLHFTimeline
-from submesh_mapping import (
-    SubmeshMapping,
+from model_mapping_group import (
+    ModelMappingGroup,
     boundary_transfer_times,
     resolve_op_transfers,
     steady_transfer_times,
@@ -19,43 +19,43 @@ class IterationResult:
     total_time: float
     per_stage_times: list[float] = field(default_factory=list)
     per_boundary_times: list[float] = field(default_factory=list)
-    # Flattened across stages and submeshes in stage-then-submesh-then-mm order.
+    # Flattened across stages and groups in stage-then-group-then-mm order.
     # Useful for validation / introspection.
     per_mm_results: list[SimulationResult] = field(default_factory=list)
 
 
 def simulate_stage(
-    stage: list[SubmeshMapping],
+    stage: list[ModelMappingGroup],
     workload_ctx: WorkloadContext,
     hw: HardwareSpec,
     topo: HostTopo,
 ) -> float:
-    """Wall time for a stage executed in parallel across submeshes.
+    """Wall time for a stage executed in parallel across groups.
 
-    All submeshes share the cluster fabric, so steady and boundary
+    All groups share the cluster fabric, so steady and boundary
     snapshots are taken once across every NetworkOp from every ModelMapping
-    in every SubmeshMapping. Each submesh then sums its own ModelMappings'
+    in every ModelMappingGroup. Each group then sums its own ModelMappings'
     times against those snapshots, and the stage wall time is the slowest
-    submesh.
+    group.
     """
     if not stage:
         return 0.0
 
-    all_mappings = [mm for sm in stage for mm in sm.model_mappings]
+    all_mappings = [mm for g in stage for mm in g.model_mappings]
     op_transfers = resolve_op_transfers(workload_ctx, all_mappings)
     steady_times = steady_transfer_times(op_transfers, topo)
     boundary_times = boundary_transfer_times(op_transfers, topo)
 
-    submesh_times: list[float] = []
-    for sm in stage:
-        sm_time = sum(
+    group_times: list[float] = []
+    for g in stage:
+        g_time = sum(
             mm.simulate(
                 workload_ctx, hw, op_transfers, steady_times, boundary_times,
             ).total_time
-            for mm in sm.model_mappings
+            for mm in g.model_mappings
         )
-        submesh_times.append(sm_time)
-    return max(submesh_times)
+        group_times.append(g_time)
+    return max(group_times)
 
 
 def simulate_rlhf_iteration(
@@ -74,22 +74,22 @@ def simulate_rlhf_iteration(
         if not stage:
             stage_time = 0.0
         else:
-            all_mappings = [mm for sm in stage for mm in sm.model_mappings]
+            all_mappings = [mm for g in stage for mm in g.model_mappings]
             op_transfers = resolve_op_transfers(workload_ctx, all_mappings)
             steady_times = steady_transfer_times(op_transfers, topo)
             boundary_times = boundary_transfer_times(op_transfers, topo)
 
-            submesh_times: list[float] = []
-            for sm in stage:
-                sm_time = 0.0
-                for mm in sm.model_mappings:
+            group_times: list[float] = []
+            for g in stage:
+                g_time = 0.0
+                for mm in g.model_mappings:
                     sim = mm.simulate(
                         workload_ctx, hw, op_transfers, steady_times, boundary_times,
                     )
                     per_mm_results.append(sim)
-                    sm_time += sim.total_time
-                submesh_times.append(sm_time)
-            stage_time = max(submesh_times)
+                    g_time += sim.total_time
+                group_times.append(g_time)
+            stage_time = max(group_times)
         total += stage_time
         per_stage_times.append(stage_time)
         if i < len(timeline.boundaries):

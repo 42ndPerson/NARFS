@@ -31,7 +31,7 @@ from operator_base import Operator
 from simulator import simulate_rlhf_iteration
 from stages import RLHFTimeline
 from strategies import MegatronStrategy
-from submesh_mapping import SubmeshMapping
+from model_mapping_group import ModelMappingGroup
 from topo import Device, HostTopo, Link, Path as TopoPath
 from validation.scenarios import SCENARIOS, Scenario
 
@@ -247,8 +247,8 @@ def op_type_breakdown(
 
 def run_scenario(scenario: Scenario) -> ScenarioResult:
     mm, topo = build_model_mapping(scenario)
-    submesh = SubmeshMapping(model_mappings=[mm], submesh=mm.mesh)
-    timeline = RLHFTimeline(stages=[[submesh]], boundaries=[])
+    group = ModelMappingGroup(model_mappings=[mm])
+    timeline = RLHFTimeline(stages=[[group]], boundaries=[])
 
     iter_result = simulate_rlhf_iteration(timeline, scenario.workload_ctx, scenario.hardware, topo)
     if not iter_result.per_mm_results:

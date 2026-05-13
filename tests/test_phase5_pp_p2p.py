@@ -15,8 +15,8 @@ new behavior:
 from __future__ import annotations
 
 from hardware import HardwareSpec
-from mesh import Mesh
 from model_mapping import ModelMapping
+from model_mapping_group import ModelMappingGroup
 from network_op import P2P
 from network_requirement import (
     CollectiveKind,
@@ -29,7 +29,6 @@ from operators.llama_config import LlamaConfig
 from relation import NetworkPhase
 from simulator import simulate_stage
 from strategies import MegatronStrategy
-from submesh_mapping import SubmeshMapping
 from topo import Device, HostTopo, Link, Path
 from workload_context import Workload, WorkloadContext
 
@@ -163,7 +162,7 @@ def test_pp_p2p_forward_goes_pp0_to_pp1_backward_reverses():
 
 
 def test_pp_p2p_size_matches_T_h_dtype_after_resolve():
-    from submesh_mapping import resolve_op_transfers
+    from model_mapping_group import resolve_op_transfers
 
     mm = _make_mapping(
         ParallelismConfig(tp=1, pp=2, dp=1), Workload.TRAINING, [0, 1],
@@ -204,7 +203,7 @@ def test_pp_bubble_formula_includes_p2p_per_mb_additively():
     the additive term is present and grows with prompt_len."""
     topo = _make_topo(num_hosts=2)
     pp2 = _make_mapping(ParallelismConfig(tp=1, pp=2, dp=1), Workload.PREPARATION, [0, 1])
-    sm = SubmeshMapping([pp2], Mesh(devices=[_dev(0), _dev(1)]))
+    sm = ModelMappingGroup([pp2])
 
     ctx_short = _ctx(prompt_len=64, num_microbatches=2)
     ctx_long = _ctx(prompt_len=512, num_microbatches=2)
@@ -231,7 +230,7 @@ def test_pp_p2p_in_network_ops_dict_for_refresh():
 
 
 def test_pp_p2p_size_scales_with_microbatch_size():
-    from submesh_mapping import resolve_op_transfers
+    from model_mapping_group import resolve_op_transfers
 
     mm = _make_mapping(
         ParallelismConfig(tp=1, pp=2, dp=1), Workload.TRAINING, [0, 1],

@@ -5,7 +5,7 @@ from hardware import HardwareSpec
 from model_mapping import ModelMapping
 from network_op import NetworkOp
 from relation import NetworkPhase
-from resharding import NaiveP2PStrategy, ReshardingStrategy
+from strategies import MegatronToMegatronP2P, ReshardingStrategy
 from topo import HostTopo
 
 
@@ -23,7 +23,7 @@ class StageTransition:
 
     source: ModelMapping
     dest: ModelMapping
-    strategy: ReshardingStrategy = field(default_factory=NaiveP2PStrategy)
+    strategy: ReshardingStrategy = field(default_factory=MegatronToMegatronP2P)
     network_ops: list[NetworkOp] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:

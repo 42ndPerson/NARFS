@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 from hardware import HardwareSpec
 from network_op import NetworkOp
-from submesh_mapping import SubmeshMapping
+from model_mapping_group import ModelMappingGroup
 from topo import HostTopo
 from transition import StageTransition
 
@@ -41,7 +41,7 @@ class RLHFTimeline:
     different ModelMappings.
     """
 
-    stages: list[list[SubmeshMapping]]
+    stages: list[list[ModelMappingGroup]]
     boundaries: list[StageBoundary] = field(default_factory=list)
 
     def __post_init__(self) -> None:
