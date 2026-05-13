@@ -9,19 +9,36 @@ from shard import Shard
 from topo import Device, HostTopo
 
 if TYPE_CHECKING:
-    # ModelMapping imports NetworkOp at runtime; defer this back-reference to
-    # break the cycle.
     from model_mapping import ModelMapping
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, eq=False)
 class NetworkOp(ABC):
-    logical_transfers: list[LogicalTransfer]
+    """A network operator: a structural description of one collective.
+
+    The op carries `endpoint_pairs` — the directed (src, dst) device pairs
+    its transfers traverse — but is stateless w.r.t. payload size. Callers
+    invoke `logical_transfers(total_data_GB)` to materialize a fresh list
+    of `LogicalTransfer`s for a given total payload, then pass that list
+    (along with a transfer-times snapshot) to `get_operator_time` to
+    compute the op's wall time.
+
+    `total_data_GB` is stored on the op for cases where the size is known
+    at construction (e.g. boundary resharding P2Ps with precomputed
+    parameter byte counts). Requirement-driven ops leave it at 0; the
+    orchestrator supplies the per-ctx total via the requirement's
+    `data_GB_fn`.
+
+    Identity equality (`eq=False`): two NetworkOp instances are distinct
+    objects, deduped upstream by `NetworkRequirement` equality. This makes
+    NetworkOp hashable by identity so `dict[NetworkOp, ...]` works in the
+    orchestration layer.
+    """
+
+    endpoint_pairs: list[tuple[Device, Device]]
+    total_data_GB: float = 0.0
     # Per-instance contention class. Defaults to the subclass's DEFAULT_PHASE
-    # (resolved in __post_init__) so the common case stays ergonomic, but any
-    # call site can override — e.g. a P2P used as pipeline send/recv that
-    # contends as a steady-state stream rather than a boundary one-shot.
-    # kw_only so that @dataclass subclasses can still add positional fields
-    # without defaults (CombinedNetworkOp.stages).
+    # (resolved in __post_init__).
     phase: Optional[NetworkPhase] = field(default=None, kw_only=True)
 
     # Subclasses set this to declare the typical phase for the op type.
@@ -36,250 +53,273 @@ class NetworkOp(ABC):
     def phase_of(op: NetworkOp) -> Optional[NetworkPhase]:
         return op.phase
 
+    @abstractmethod
+    def logical_transfers(self, total_data_GB: float) -> list[LogicalTransfer]:
+        """Fresh per-link payload distribution for a given total. Pure."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_operator_time(
+        self,
+        transfers: list[LogicalTransfer],
+        transfer_times: dict[LogicalTransfer, float],
+    ) -> float:
+        """Wall time for this collective given resolved transfers and a
+        per-transfer times dict. `transfers` must be the list returned by
+        `logical_transfers(total)` for the relevant total; the caller is
+        responsible for passing coherent inputs.
+        """
+        raise NotImplementedError
+
     @staticmethod
-    def time_simultaneous_system_flow(ops: list[NetworkOp], topo: HostTopo) -> list[float]:
-        all_transfers = [transfer for op in ops for transfer in op.logical_transfers]
+    def time_simultaneous_system_flow(
+        ops: list[NetworkOp], topo: HostTopo
+    ) -> list[float]:
+        """Per-op wall times under flow-time contention. Used at stage
+        boundaries (resharding) where ops carry their fixed `total_data_GB`.
+        """
+        op_transfers = {op: op.logical_transfers(op.total_data_GB) for op in ops}
+        all_transfers = [t for ts in op_transfers.values() for t in ts]
         if not all_transfers:
             return [0.0 for _ in ops]
-        # topo.get_simultaneous_system_flow_time consumes LogicalTransfer
-        # objects and returns dict[(src, dst), time]. Map each transfer to
-        # its pair's time so each op sees a dict[LogicalTransfer, time].
         pair_times = topo.get_simultaneous_system_flow_time(all_transfers)
         transfer_times: dict[LogicalTransfer, float] = {
             t: pair_times.get((t.src_device, t.dst_device), 0.0) for t in all_transfers
         }
-        return [op.get_operator_time(transfer_times) for op in ops]
+        return [op.get_operator_time(op_transfers[op], transfer_times) for op in ops]
 
-    @staticmethod
-    def time_simultaneous_system_operators(ops: list[NetworkOp], topo: HostTopo) -> list[float]:
-        all_transfers = [transfer for op in ops for transfer in op.logical_transfers]
-        if not all_transfers:
-            return [0.0 for _ in ops]
-        transfer_times = topo.get_simultaneous_logical_transfer_times(all_transfers)
-        return [op.get_operator_time(transfer_times) for op in ops]
 
-    @abstractmethod
-    def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
-        raise NotImplementedError("Subclasses must implement get_operator_time")
+# ---- per-collective subclasses ----------------------------------------------
 
-    # ---- Phase 1: workload-dependent transfer sizing -------------------------
-    # `refresh_data_size(total_data_GB)` rebuilds `logical_transfers` in place
-    # so the simulator can re-derive sizes against the current WorkloadContext
-    # before each snapshot. The class default is a no-op (suits CombinedNetworkOp
-    # and any future subclass with no own transfers); concrete collectives
-    # override to apply their per-transfer split.
-
-    def refresh_data_size(self, total_data_GB: float) -> None:
-        """Replace `logical_transfers` data_GB values from a new total.
-
-        Default is a no-op; collective subclasses override to apply their
-        distribution pattern (ring/all-to-all/etc.). Subclasses use the
-        `_rebuild_uniform` helper.
-        """
-        return
-
-    def _rebuild_uniform(self, per_transfer_data_GB: float) -> None:
-        """Replace each LogicalTransfer with a fresh instance carrying the
-        given uniform per-transfer size, preserving (src, dst) pairings.
-        """
-        new_transfers = [
-            LogicalTransfer(
-                src_device=t.src_device,
-                dst_device=t.dst_device,
-                data_GB=per_transfer_data_GB,
-            )
-            for t in self.logical_transfers
-        ]
-        self.logical_transfers.clear()
-        self.logical_transfers.extend(new_transfers)
-
-@dataclass(frozen=True)
-class CombinedNetworkOp(NetworkOp):
-    stages: list[NetworkOp]
-
-    def __init__(self, stages: list[NetworkOp], phase: Optional[NetworkPhase] = None):
-        # Frozen dataclass forbids attribute assignment after __init__ runs;
-        # bypass via object.__setattr__ to populate the inherited and own fields.
-        # phase has no natural default for a composite (sub-stages may differ),
-        # so callers pass one explicitly when they need phase_of() to resolve.
-        object.__setattr__(self, "stages", stages)
-        object.__setattr__(self, "logical_transfers", []) # Irrelevant for combined operations
-        object.__setattr__(self, "phase", phase)
-
-    def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
-        total_time = 0.0
-        for stage in self.stages:
-            stage_time = stage.get_operator_time(transfer_times)
-            total_time += stage_time
-        return total_time
 
 class AllReduceRing(NetworkOp):
     DEFAULT_PHASE = NetworkPhase.STEADY
 
     @classmethod
-    def generate(cls, model_mapping: ModelMapping, shards_ring: list[Shard], data_GB: float) -> AllReduceRing:
+    def generate(
+        cls, model_mapping: ModelMapping, shards_ring: list[Shard]
+    ) -> AllReduceRing:
+        """Build the (src, dst) device pairs for a ring of `shards_ring`.
+
+        Sensitive to ring order (minor effect under tree structure, but
+        major effect under highly differentiated path bandwidths).
         """
-        Sensitive to ring order (should have minor effect under tree structure, but could have major effect under multiple, highly differentiated paths)
-        """
-        logical_transfers = []
+        pairs: list[tuple[Device, Device]] = []
         n = len(shards_ring)
         if n > 1:
             for i in range(n):
                 next_i = (i + 1) % n
-                logical_transfers.append(LogicalTransfer(
-                    src_device=model_mapping.shards_to_devices[shards_ring[i]],
-                    dst_device=model_mapping.shards_to_devices[shards_ring[next_i]],
-                    data_GB=data_GB / n
+                pairs.append((
+                    model_mapping.shards_to_devices[shards_ring[i]],
+                    model_mapping.shards_to_devices[shards_ring[next_i]],
                 ))
-        return cls(logical_transfers=logical_transfers)
+        return cls(endpoint_pairs=pairs)
 
-    def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
-        if not self.logical_transfers: return 0.0
-        n = len(self.logical_transfers)
-        max_time = max(transfer_times.get(t, 0.0) for t in self.logical_transfers)
-        # Ring all-reduce is 2*(n-1) steps, each taking max bottleneck time of size data_GB/n
+    def logical_transfers(self, total_data_GB: float) -> list[LogicalTransfer]:
+        # Ring with n hops; each hop carries total/n.
+        n = len(self.endpoint_pairs)
+        per = total_data_GB / n if n else 0.0
+        return [
+            LogicalTransfer(src_device=src, dst_device=dst, data_GB=per)
+            for src, dst in self.endpoint_pairs
+        ]
+
+    def get_operator_time(
+        self,
+        transfers: list[LogicalTransfer],
+        transfer_times: dict[LogicalTransfer, float],
+    ) -> float:
+        if not transfers:
+            return 0.0
+        n = len(transfers)
+        max_time = max(transfer_times.get(t, 0.0) for t in transfers)
+        # Ring all-reduce is 2*(n-1) steps, each taking the bottleneck transfer time.
         return max_time * 2 * (n - 1) if n > 0 else 0.0
 
-    def refresh_data_size(self, total_data_GB: float) -> None:
-        # Ring with n hops; each hop carries total/n.
-        n = len(self.logical_transfers)
-        self._rebuild_uniform(total_data_GB / n if n else 0.0)
 
 class AllGatherRing(NetworkOp):
     DEFAULT_PHASE = NetworkPhase.STEADY
 
     @classmethod
-    def generate(cls, model_mapping: ModelMapping, shards_ring: list[Shard], data_GB: float) -> AllGatherRing:
-        """
-        Sensitive to ring order (should have minor effect under tree structure, but could have major effect under multiple, highly differentiated paths)
-        """
-        logical_transfers = []
+    def generate(
+        cls, model_mapping: ModelMapping, shards_ring: list[Shard]
+    ) -> AllGatherRing:
+        pairs: list[tuple[Device, Device]] = []
         n = len(shards_ring)
         if n > 1:
             for i in range(n):
                 next_i = (i + 1) % n
-                logical_transfers.append(LogicalTransfer(
-                    src_device=model_mapping.shards_to_devices[shards_ring[i]],
-                    dst_device=model_mapping.shards_to_devices[shards_ring[next_i]],
-                    data_GB=data_GB / n
+                pairs.append((
+                    model_mapping.shards_to_devices[shards_ring[i]],
+                    model_mapping.shards_to_devices[shards_ring[next_i]],
                 ))
-        return cls(logical_transfers=logical_transfers)
+        return cls(endpoint_pairs=pairs)
 
-    def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
-        if not self.logical_transfers: return 0.0
-        n = len(self.logical_transfers)
-        max_time = max(transfer_times.get(t, 0.0) for t in self.logical_transfers)
+    def logical_transfers(self, total_data_GB: float) -> list[LogicalTransfer]:
+        n = len(self.endpoint_pairs)
+        per = total_data_GB / n if n else 0.0
+        return [
+            LogicalTransfer(src_device=src, dst_device=dst, data_GB=per)
+            for src, dst in self.endpoint_pairs
+        ]
+
+    def get_operator_time(
+        self,
+        transfers: list[LogicalTransfer],
+        transfer_times: dict[LogicalTransfer, float],
+    ) -> float:
+        if not transfers:
+            return 0.0
+        n = len(transfers)
+        max_time = max(transfer_times.get(t, 0.0) for t in transfers)
         # Ring all-gather takes n-1 steps, each moving data_GB/n over the ring.
         return max_time * (n - 1) if n > 0 else 0.0
 
-    def refresh_data_size(self, total_data_GB: float) -> None:
-        n = len(self.logical_transfers)
-        self._rebuild_uniform(total_data_GB / n if n else 0.0)
 
 class ReduceScatterRing(NetworkOp):
     DEFAULT_PHASE = NetworkPhase.STEADY
 
     @classmethod
-    def generate(cls, model_mapping: ModelMapping, shards_ring: list[Shard], data_GB: float) -> ReduceScatterRing:
-        """
-        Sensitive to ring order (should have minor effect under tree structure, but could have major effect under multiple, highly differentiated paths)
-        """
-        # Same logical traffic volume pattern as all_gather in a ring
-        base_op = AllGatherRing.generate(model_mapping, shards_ring, data_GB)
-        return cls(logical_transfers=base_op.logical_transfers)
+    def generate(
+        cls, model_mapping: ModelMapping, shards_ring: list[Shard]
+    ) -> ReduceScatterRing:
+        # Same logical traffic pattern as ring all-gather.
+        base = AllGatherRing.generate(model_mapping, shards_ring)
+        return cls(endpoint_pairs=base.endpoint_pairs)
 
-    def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
-        if not self.logical_transfers: return 0.0
-        n = len(self.logical_transfers)
-        max_time = max(transfer_times.get(t, 0.0) for t in self.logical_transfers)
+    def logical_transfers(self, total_data_GB: float) -> list[LogicalTransfer]:
+        n = len(self.endpoint_pairs)
+        per = total_data_GB / n if n else 0.0
+        return [
+            LogicalTransfer(src_device=src, dst_device=dst, data_GB=per)
+            for src, dst in self.endpoint_pairs
+        ]
+
+    def get_operator_time(
+        self,
+        transfers: list[LogicalTransfer],
+        transfer_times: dict[LogicalTransfer, float],
+    ) -> float:
+        if not transfers:
+            return 0.0
+        n = len(transfers)
+        max_time = max(transfer_times.get(t, 0.0) for t in transfers)
         # Ring reduce-scatter takes n-1 steps.
         return max_time * (n - 1) if n > 0 else 0.0
 
-    def refresh_data_size(self, total_data_GB: float) -> None:
-        n = len(self.logical_transfers)
-        self._rebuild_uniform(total_data_GB / n if n else 0.0)
 
 class AllToAll(NetworkOp):
     DEFAULT_PHASE = NetworkPhase.STEADY
 
     @classmethod
-    def generate(cls, model_mapping: ModelMapping, shards: list[Shard], data_GB: float) -> AllToAll:
-        logical_transfers = []
-        # In an all-to-all, every node sends data_GB/N to every other node
+    def generate(
+        cls, model_mapping: ModelMapping, shards: list[Shard]
+    ) -> AllToAll:
+        pairs: list[tuple[Device, Device]] = []
+        # Every node sends to every other node (N*(N-1) directed transfers).
         for i in range(len(shards)):
             for j in range(len(shards)):
                 if i != j:
-                    logical_transfers.append(LogicalTransfer(
-                        src_device=model_mapping.shards_to_devices[shards[i]],
-                        dst_device=model_mapping.shards_to_devices[shards[j]],
-                        data_GB=data_GB / len(shards)
+                    pairs.append((
+                        model_mapping.shards_to_devices[shards[i]],
+                        model_mapping.shards_to_devices[shards[j]],
                     ))
-        return cls(logical_transfers=logical_transfers)
+        return cls(endpoint_pairs=pairs)
 
-    def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
-        if not self.logical_transfers: return 0.0
-        # In this logical model all connections happen simultaneously.
-        # The time for the operator is just the maximum connection time.
-        return max(transfer_times.get(t, 0.0) for t in self.logical_transfers)
-
-    def refresh_data_size(self, total_data_GB: float) -> None:
-        # AllToAll across N nodes has N*(N-1) transfers, each carrying
-        # total_data_GB / N. Solve for N from the transfer count.
-        nt = len(self.logical_transfers)
+    def logical_transfers(self, total_data_GB: float) -> list[LogicalTransfer]:
+        # AllToAll across N nodes has N*(N-1) transfers, each carrying total/N.
+        nt = len(self.endpoint_pairs)
         if nt == 0:
-            return
+            return []
         # N(N-1) = nt → N = (1 + sqrt(1 + 4*nt)) / 2.
         N = (1 + math.isqrt(1 + 4 * nt)) // 2
-        # Defensive: if N(N-1) doesn't match (shouldn't happen with a
-        # well-formed AllToAll), fall back to per-transfer = total / nt.
-        if N * (N - 1) != nt:
-            self._rebuild_uniform(total_data_GB / nt)
-            return
-        self._rebuild_uniform(total_data_GB / N)
+        per = total_data_GB / N if N * (N - 1) == nt and N > 0 else total_data_GB / nt
+        return [
+            LogicalTransfer(src_device=src, dst_device=dst, data_GB=per)
+            for src, dst in self.endpoint_pairs
+        ]
+
+    def get_operator_time(
+        self,
+        transfers: list[LogicalTransfer],
+        transfer_times: dict[LogicalTransfer, float],
+    ) -> float:
+        if not transfers:
+            return 0.0
+        # All connections happen simultaneously; op time = slowest transfer.
+        return max(transfer_times.get(t, 0.0) for t in transfers)
+
 
 class Broadcast(NetworkOp):
     DEFAULT_PHASE = NetworkPhase.BOUNDARY
 
     @classmethod
-    def generate(cls, model_mapping: ModelMapping, src_shard: Shard, dst_shards: list[Shard], data_GB: float) -> Broadcast:
-        logical_transfers = []
+    def generate(
+        cls,
+        model_mapping: ModelMapping,
+        src_shard: Shard,
+        dst_shards: list[Shard],
+        total_data_GB: float = 0.0,
+    ) -> Broadcast:
+        pairs: list[tuple[Device, Device]] = []
         src_device = model_mapping.shards_to_devices[src_shard]
         for dst in dst_shards:
             if src_shard != dst:
-                logical_transfers.append(LogicalTransfer(
-                    src_device=src_device,
-                    dst_device=model_mapping.shards_to_devices[dst],
-                    data_GB=data_GB
-                ))
-        return cls(logical_transfers=logical_transfers)
+                pairs.append((src_device, model_mapping.shards_to_devices[dst]))
+        return cls(endpoint_pairs=pairs, total_data_GB=total_data_GB)
 
-    def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
-        if not self.logical_transfers: return 0.0
-        # A simple star broadcast time is dominated by the slowest link.
-        return max(transfer_times.get(t, 0.0) for t in self.logical_transfers)
+    def logical_transfers(self, total_data_GB: float) -> list[LogicalTransfer]:
+        # Each receiver gets the full payload.
+        return [
+            LogicalTransfer(src_device=src, dst_device=dst, data_GB=total_data_GB)
+            for src, dst in self.endpoint_pairs
+        ]
 
-    def refresh_data_size(self, total_data_GB: float) -> None:
-        # Each receiver gets the full payload — per-transfer = total.
-        self._rebuild_uniform(total_data_GB)
+    def get_operator_time(
+        self,
+        transfers: list[LogicalTransfer],
+        transfer_times: dict[LogicalTransfer, float],
+    ) -> float:
+        if not transfers:
+            return 0.0
+        # Star broadcast time is dominated by the slowest link.
+        return max(transfer_times.get(t, 0.0) for t in transfers)
+
 
 class P2P(NetworkOp):
     DEFAULT_PHASE = NetworkPhase.BOUNDARY
 
     @classmethod
-    def generate(cls, model_mapping: ModelMapping, src_shard: Shard, dst_shard: Shard, data_GB: float) -> P2P:
-        return cls(logical_transfers=[LogicalTransfer(
-            src_device=model_mapping.shards_to_devices[src_shard],
-            dst_device=model_mapping.shards_to_devices[dst_shard],
-            data_GB=data_GB
-        )])
+    def generate(
+        cls,
+        model_mapping: ModelMapping,
+        src_shard: Shard,
+        dst_shard: Shard,
+        total_data_GB: float = 0.0,
+    ) -> P2P:
+        return cls(
+            endpoint_pairs=[(
+                model_mapping.shards_to_devices[src_shard],
+                model_mapping.shards_to_devices[dst_shard],
+            )],
+            total_data_GB=total_data_GB,
+        )
 
-    def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
-        if not self.logical_transfers: return 0.0
-        return max(transfer_times.get(t, 0.0) for t in self.logical_transfers)
+    def logical_transfers(self, total_data_GB: float) -> list[LogicalTransfer]:
+        return [
+            LogicalTransfer(src_device=src, dst_device=dst, data_GB=total_data_GB)
+            for src, dst in self.endpoint_pairs
+        ]
 
-    def refresh_data_size(self, total_data_GB: float) -> None:
-        # Single transfer carries the full payload.
-        self._rebuild_uniform(total_data_GB)
+    def get_operator_time(
+        self,
+        transfers: list[LogicalTransfer],
+        transfer_times: dict[LogicalTransfer, float],
+    ) -> float:
+        if not transfers:
+            return 0.0
+        return max(transfer_times.get(t, 0.0) for t in transfers)
+
 
 @dataclass(frozen=True)
 class LogicalTransfer:

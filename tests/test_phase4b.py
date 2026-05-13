@@ -12,10 +12,7 @@ from network_op import (
     NetworkOp,
     P2P,
 )
-from network_requirement import (
-    CollectiveKind,
-    ParallelismConfig,
-)
+from network_requirement import ParallelismConfig
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import NetworkPhase
@@ -90,7 +87,6 @@ def _make_mapping(
     parallelism: ParallelismConfig,
     workload: Workload,
     host_ids: list[int],
-    data_GB_estimates: dict[CollectiveKind, float] | None = None,
 ) -> ModelMapping:
     expected = parallelism.dp * parallelism.pp * parallelism.tp
     if len(host_ids) != expected:
@@ -117,7 +113,6 @@ def _make_mapping(
         parallelism=parallelism,
         shards_to_devices=s2d,
         device_to_shard=d2s,
-        data_GB_estimates=data_GB_estimates or {},
     )
 
 
@@ -161,11 +156,9 @@ def test_naive_p2p_resharding_byte_count_matches_full_model():
         assert isinstance(op, P2P), f"resharding op should be P2P, got {type(op).__name__}"
         assert NetworkOp.phase_of(op) is NetworkPhase.BOUNDARY
 
-    total_bytes = sum(
-        t.data_GB * 1e9
-        for op in transition.network_ops
-        for t in op.logical_transfers
-    )
+    # Resharding ops bake `total_data_GB` at construction (sizes are known
+    # up-front from parameter byte counts). Sum directly.
+    total_bytes = sum(op.total_data_GB * 1e9 for op in transition.network_ops)
     expected = llama_total_parameter_bytes(SMALL_LLAMA)
     assert math.isclose(total_bytes, expected, rel_tol=1e-6), (
         f"total resharding bytes {total_bytes:.0f} != full model bytes {expected}"
@@ -186,14 +179,12 @@ def test_rlhf_iteration_sums_stages_and_boundary():
         ParallelismConfig(tp=2, pp=1, dp=1, ep=1),
         Workload.TRAINING,
         host_ids=[0, 1],
-        data_GB_estimates={CollectiveKind.ALL_REDUCE: 0.001},
     )
     gen_mm = _make_mapping(
         model,
         ParallelismConfig(tp=2, pp=1, dp=1, ep=1),
         Workload.GENERATION,
         host_ids=[2, 3],
-        data_GB_estimates={CollectiveKind.ALL_REDUCE: 0.001},
     )
     train_sm = SubmeshMapping(model_mappings=[train_mm], submesh=_mesh_for([0, 1]))
     gen_sm = SubmeshMapping(model_mappings=[gen_mm], submesh=_mesh_for([2, 3]))
@@ -316,10 +307,8 @@ def test_steady_contention_two_concurrent_submeshes_share_spine():
     model_a = LlamaModel(name="a", role="actor", architecture=arch)
     model_b = LlamaModel(name="b", role="critic", architecture=arch)
 
-    ar_estimate = {CollectiveKind.ALL_REDUCE: 0.01}  # 10 MB per AR — large vs spine
-
-    mm_a = _make_mapping(model_a, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1], ar_estimate)
-    mm_b = _make_mapping(model_b, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [2, 3], ar_estimate)
+    mm_a = _make_mapping(model_a, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
+    mm_b = _make_mapping(model_b, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [2, 3])
 
     topo = _make_topo(num_hosts=4, spine_bw_gbps=1.0, link_latency_ms=0.0)
     ctx = _ctx(prompt_len=64)

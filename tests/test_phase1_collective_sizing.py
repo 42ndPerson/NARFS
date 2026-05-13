@@ -2,17 +2,14 @@
 
 Pins down:
 
-- TP-AR transfer sizes match the analytical `T·h·dtype` formula after
-  `simulate` triggers a refresh.
+- TP-AR transfer sizes match the analytical `T·h·dtype` formula when
+  resolved against a workload ctx.
 - Doubling `microbatch_size` ~doubles the per-AR transfer time (modulo
   topology latency floor).
 - The `payload_id` discriminator splits same-shape/different-size
-  collectives into independent dedup buckets, so per-occurrence sizing
-  survives.
-- The legacy `data_GB_estimates` fallback still works when no
-  `data_GB_fn` is supplied.
-- `NetworkOp.refresh_data_size` produces the right per-transfer split for
-  each subclass's distribution pattern.
+  collectives into independent dedup buckets.
+- `NetworkOp.logical_transfers(total)` produces the right per-transfer
+  split for each subclass's distribution pattern.
 """
 from __future__ import annotations
 
@@ -25,7 +22,6 @@ from network_op import (
     AllReduceRing,
     AllToAll,
     Broadcast,
-    LogicalTransfer,
     P2P,
 )
 from network_requirement import (
@@ -38,6 +34,7 @@ from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import Relation
 from shard import Shard
+from submesh_mapping import resolve_op_transfers
 from topo import Device, HostTopo, Link, Path
 from workload_context import (
     TokenCount,
@@ -75,9 +72,6 @@ def _dev(host: int) -> Device:
 
 
 def _shared_spine_topo(num_hosts: int, bw_gbps: float = 100.0) -> HostTopo:
-    """All inter-device pairs share one spine link (so we can reason about
-    aggregate AR bandwidth analytically). Zero latency keeps the math clean.
-    """
     spine = Link(node_a_id=-1, node_b_id=-2, bandwidth=bw_gbps, latency=0.0)
     huge = 1e9
 
@@ -134,64 +128,50 @@ def _ctx(microbatch: int = 1, prompt_len: int = 256) -> WorkloadContext:
     )
 
 
+def _ar_op_and_req(mm: ModelMapping) -> tuple[AllReduceRing, NetworkRequirement]:
+    for req, op in mm.network_ops.items():
+        if req.kind is CollectiveKind.ALL_REDUCE and req.group is ParallelismGroup.TP:
+            assert isinstance(op, AllReduceRing)
+            return op, req
+    raise AssertionError("no TP AllReduce requirement found")
+
+
 # ---- core sizing tests -------------------------------------------------------
 
 
-def test_tp_all_reduce_size_matches_T_h_dtype_after_refresh():
-    """After `refresh_collective_sizes(ctx)`, every TP-AR transfer's data_GB
-    matches the analytical `T * h * dtype / 1e9`, split across the ring."""
+def test_tp_all_reduce_size_matches_T_h_dtype_after_resolve():
+    """When `resolve_op_transfers(ctx, [mm])` runs, every TP-AR transfer's
+    data_GB matches the analytical `T·h·dtype/1e9`, split across the ring."""
     mm = _make_mapping(ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
     ctx = _ctx(microbatch=1, prompt_len=256)
 
-    mm.refresh_collective_sizes(ctx)
+    op_transfers = resolve_op_transfers(ctx, [mm])
+    ar_op, _ = _ar_op_and_req(mm)
+    transfers = op_transfers[ar_op]
 
-    ar_op = next(
-        op for req, op in mm.network_ops.items()
-        if req.kind is CollectiveKind.ALL_REDUCE and req.group is ParallelismGroup.TP
-    )
-    assert isinstance(ar_op, AllReduceRing)
-
-    # Expected total: T·h·dtype bytes; ring has tp transfers each carrying total/tp.
     T = ctx.microbatch_size * ctx.prompt_len
     expected_total_GB = T * SMALL_LLAMA.h * SMALL_LLAMA.dtype_bytes / 1e9
-    expected_per_transfer = expected_total_GB / len(ar_op.logical_transfers)
-    for t in ar_op.logical_transfers:
+    expected_per_transfer = expected_total_GB / len(transfers)
+    for t in transfers:
         assert t.data_GB == pytest.approx(expected_per_transfer)
 
 
 def test_doubling_microbatch_doubles_ar_transfer_size():
-    """Sizing closure is a pure function of ctx — `microbatch_size` is the
-    only knob that affects per-AR data here, so doubling it doubles the
-    transfer."""
     mm = _make_mapping(ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
-    ar_op = next(
-        op for req, op in mm.network_ops.items()
-        if req.kind is CollectiveKind.ALL_REDUCE and req.group is ParallelismGroup.TP
-    )
+    ar_op, _ = _ar_op_and_req(mm)
 
-    mm.refresh_collective_sizes(_ctx(microbatch=1, prompt_len=128))
-    size_at_1 = ar_op.logical_transfers[0].data_GB
-
-    mm.refresh_collective_sizes(_ctx(microbatch=2, prompt_len=128))
-    size_at_2 = ar_op.logical_transfers[0].data_GB
-
-    assert size_at_2 == pytest.approx(2 * size_at_1)
+    transfers_1 = resolve_op_transfers(_ctx(microbatch=1, prompt_len=128), [mm])[ar_op]
+    transfers_2 = resolve_op_transfers(_ctx(microbatch=2, prompt_len=128), [mm])[ar_op]
+    assert transfers_2[0].data_GB == pytest.approx(2 * transfers_1[0].data_GB)
 
 
 def test_doubling_prompt_len_doubles_ar_transfer_size():
     mm = _make_mapping(ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
-    ar_op = next(
-        op for req, op in mm.network_ops.items()
-        if req.kind is CollectiveKind.ALL_REDUCE and req.group is ParallelismGroup.TP
-    )
+    ar_op, _ = _ar_op_and_req(mm)
 
-    mm.refresh_collective_sizes(_ctx(microbatch=1, prompt_len=128))
-    size_at_128 = ar_op.logical_transfers[0].data_GB
-
-    mm.refresh_collective_sizes(_ctx(microbatch=1, prompt_len=256))
-    size_at_256 = ar_op.logical_transfers[0].data_GB
-
-    assert size_at_256 == pytest.approx(2 * size_at_128)
+    transfers_128 = resolve_op_transfers(_ctx(microbatch=1, prompt_len=128), [mm])[ar_op]
+    transfers_256 = resolve_op_transfers(_ctx(microbatch=1, prompt_len=256), [mm])[ar_op]
+    assert transfers_256[0].data_GB == pytest.approx(2 * transfers_128[0].data_GB)
 
 
 def test_tp_ar_time_scales_with_microbatch():
@@ -202,12 +182,11 @@ def test_tp_ar_time_scales_with_microbatch():
 
     mm = _make_mapping(ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
     submesh = SubmeshMapping(model_mappings=[mm], submesh=mm.mesh)
-    topo = _shared_spine_topo(num_hosts=2, bw_gbps=10.0)  # narrow spine → AR cost is visible
+    topo = _shared_spine_topo(num_hosts=2, bw_gbps=10.0)
 
     t1 = simulate_stage([submesh], _ctx(microbatch=1, prompt_len=512), A100, topo)
     t2 = simulate_stage([submesh], _ctx(microbatch=2, prompt_len=512), A100, topo)
 
-    # t2 > t1 strictly — doubled compute and doubled AR data both add cost.
     assert t2 > t1, f"expected t2 > t1, got t1={t1:.6f} t2={t2:.6f}"
 
 
@@ -215,8 +194,6 @@ def test_tp_ar_time_scales_with_microbatch():
 
 
 def test_requirements_with_same_fields_dedupe():
-    """Same (kind, relation, eta, group, payload_id=None) → dict collision.
-    This is the dedup behavior the codebase has always relied on."""
     a = NetworkRequirement(
         kind=CollectiveKind.ALL_REDUCE,
         relation=Relation.EXCLUSIVE,
@@ -234,19 +211,17 @@ def test_requirements_with_same_fields_dedupe():
     assert a == b
     assert hash(a) == hash(b)
     d = {a: "first"}
-    d[b] = "second"  # collides
+    d[b] = "second"
     assert len(d) == 1
 
 
 def test_requirements_with_distinct_payload_id_do_not_dedupe():
-    """Phase 4 needs same-shape DP-AR per layer with different sizes;
-    payload_id discriminates them."""
     a = NetworkRequirement(
         kind=CollectiveKind.ALL_REDUCE,
         relation=Relation.EXCLUSIVE,
         eta=1.0,
         group=ParallelismGroup.DP,
-        payload_id=0,  # layer 0
+        payload_id=0,
         data_GB_fn=lambda ctx: 0.001,
     )
     b = NetworkRequirement(
@@ -254,7 +229,7 @@ def test_requirements_with_distinct_payload_id_do_not_dedupe():
         relation=Relation.EXCLUSIVE,
         eta=1.0,
         group=ParallelismGroup.DP,
-        payload_id=1,  # layer 1
+        payload_id=1,
         data_GB_fn=lambda ctx: 0.002,
     )
     assert a != b
@@ -264,8 +239,6 @@ def test_requirements_with_distinct_payload_id_do_not_dedupe():
 
 
 def test_data_GB_fn_excluded_from_equality_and_hash():
-    """`data_GB_fn` must not affect equality / hash — two requirements
-    differing only in their sizing closure should still collide."""
     fn1 = lambda ctx: 0.1
     fn2 = lambda ctx: 0.2
     r1 = NetworkRequirement(
@@ -286,85 +259,42 @@ def test_data_GB_fn_excluded_from_equality_and_hash():
     assert hash(r1) == hash(r2)
 
 
-# ---- legacy fallback ---------------------------------------------------------
+# ---- per-subclass distribution -----------------------------------------------
 
 
-def test_legacy_data_GB_estimates_still_works_when_no_data_GB_fn():
-    """Builder-emitted requirements without `data_GB_fn` fall back to the
-    legacy `data_GB_estimates` dict."""
-    mm = _make_mapping(ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
-
-    # Force the legacy path: rebuild network_ops dict with a fn-less requirement.
-    legacy_req = NetworkRequirement(
-        kind=CollectiveKind.ALL_REDUCE,
-        relation=Relation.EXCLUSIVE,
-        eta=1.0,
-        group=ParallelismGroup.TP,
-    )  # no data_GB_fn
-    # Replace network_ops entries' keys with the legacy req for the test.
-    mm.network_ops = {legacy_req: next(iter(mm.network_ops.values()))}
-    mm.data_GB_estimates = {CollectiveKind.ALL_REDUCE: 0.025}  # 25 MB
-
-    mm.refresh_collective_sizes(_ctx())
-
-    op = mm.network_ops[legacy_req]
-    n = len(op.logical_transfers)
-    assert all(t.data_GB == pytest.approx(0.025 / n) for t in op.logical_transfers)
-
-
-# ---- per-subclass refresh distribution ---------------------------------------
-
-
-def test_refresh_data_size_ring_splits_evenly():
+def test_ring_logical_transfers_splits_evenly():
     """Ring patterns (AllReduce/Gather/ReduceScatter) split total/n per transfer."""
-    transfers = [
-        LogicalTransfer(src_device=_dev(0), dst_device=_dev(1), data_GB=0.0),
-        LogicalTransfer(src_device=_dev(1), dst_device=_dev(2), data_GB=0.0),
-        LogicalTransfer(src_device=_dev(2), dst_device=_dev(0), data_GB=0.0),
-    ]
-    op = AllReduceRing(logical_transfers=transfers)
-    op.refresh_data_size(0.6)
-    for t in op.logical_transfers:
+    pairs = [(_dev(0), _dev(1)), (_dev(1), _dev(2)), (_dev(2), _dev(0))]
+    op = AllReduceRing(endpoint_pairs=pairs)
+    transfers = op.logical_transfers(0.6)
+    for t in transfers:
         assert t.data_GB == pytest.approx(0.2)
 
 
-def test_refresh_data_size_alltoall_splits_by_N_not_num_transfers():
-    """AllToAll N nodes → N(N-1) transfers; each transfer carries total/N
-    (not total/N(N-1)). The per-subclass refresh solves N from transfer count."""
-    # 4 nodes (0..3), each sends to 3 others → 12 transfers.
-    transfers = [
-        LogicalTransfer(src_device=_dev(i), dst_device=_dev(j), data_GB=0.0)
-        for i in range(4) for j in range(4) if i != j
-    ]
-    assert len(transfers) == 12
-    op = AllToAll(logical_transfers=transfers)
-    op.refresh_data_size(0.4)  # total = 0.4
-    # Per-transfer should be 0.4 / 4 = 0.1 (not 0.4 / 12).
-    for t in op.logical_transfers:
-        assert t.data_GB == pytest.approx(0.1)
+def test_alltoall_logical_transfers_splits_by_N_not_num_transfers():
+    """AllToAll N nodes → N(N-1) transfers; each transfer carries total/N."""
+    pairs = [(_dev(i), _dev(j)) for i in range(4) for j in range(4) if i != j]
+    assert len(pairs) == 12
+    op = AllToAll(endpoint_pairs=pairs)
+    transfers = op.logical_transfers(0.4)
+    for t in transfers:
+        assert t.data_GB == pytest.approx(0.1)  # 0.4 / 4, not 0.4 / 12
 
 
-def test_refresh_data_size_broadcast_full_per_transfer():
-    """Broadcast: each receiver gets the full payload."""
-    transfers = [
-        LogicalTransfer(src_device=_dev(0), dst_device=_dev(1), data_GB=0.0),
-        LogicalTransfer(src_device=_dev(0), dst_device=_dev(2), data_GB=0.0),
-    ]
-    op = Broadcast(logical_transfers=transfers)
-    op.refresh_data_size(0.5)
-    for t in op.logical_transfers:
+def test_broadcast_logical_transfers_full_per_transfer():
+    pairs = [(_dev(0), _dev(1)), (_dev(0), _dev(2))]
+    op = Broadcast(endpoint_pairs=pairs)
+    transfers = op.logical_transfers(0.5)
+    for t in transfers:
         assert t.data_GB == pytest.approx(0.5)
 
 
-def test_refresh_data_size_p2p_full_payload():
-    """P2P: single transfer carries the full payload."""
-    op = P2P(logical_transfers=[LogicalTransfer(src_device=_dev(0), dst_device=_dev(1), data_GB=0.0)])
-    op.refresh_data_size(0.7)
-    assert op.logical_transfers[0].data_GB == pytest.approx(0.7)
+def test_p2p_logical_transfers_full_payload():
+    op = P2P(endpoint_pairs=[(_dev(0), _dev(1))])
+    transfers = op.logical_transfers(0.7)
+    assert transfers[0].data_GB == pytest.approx(0.7)
 
 
-def test_refresh_data_size_empty_logical_transfers_is_noop():
-    """Refresh on an op with no transfers is harmless (degenerate single-rank ring)."""
-    op = AllReduceRing(logical_transfers=[])
-    op.refresh_data_size(1.0)  # should not raise
-    assert op.logical_transfers == []
+def test_empty_endpoint_pairs_logical_transfers_is_empty():
+    op = AllReduceRing(endpoint_pairs=[])
+    assert op.logical_transfers(1.0) == []

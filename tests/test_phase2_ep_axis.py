@@ -139,7 +139,7 @@ def test_ep_alltoall_walks_ep_ranks_not_tp_ranks():
     )
     assert isinstance(a2a_op, AllToAll)
     # 4 EP ranks → 4*3 = 12 directed transfers.
-    assert len(a2a_op.logical_transfers) == 12
+    assert len(a2a_op.endpoint_pairs) == 12
 
 
 def test_tp_ar_with_ep_active_walks_only_tp_ranks():
@@ -171,7 +171,7 @@ def test_tp_ar_with_ep_active_walks_only_tp_ranks():
     )
     assert isinstance(ar_op, AllReduceRing)
     # Ring of TP=2 → 2 transfers (i→i+1 around the ring).
-    assert len(ar_op.logical_transfers) == 2
+    assert len(ar_op.endpoint_pairs) == 2
 
 
 def test_axis_validator_rejects_underprovisioned_ep_layout():

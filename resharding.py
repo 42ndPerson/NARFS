@@ -18,7 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from network_op import LogicalTransfer, NetworkOp, P2P
+from network_op import NetworkOp, P2P
 from operators.llama_config import LlamaConfig
 from shard import Shard
 from topo import Device
@@ -203,14 +203,14 @@ class NaiveP2PStrategy(ReshardingStrategy):
         for (src_device, dst_device), bytes_total in agg.items():
             if bytes_total <= 0:
                 continue
-            transfer = LogicalTransfer(
-                src_device=src_device,
-                dst_device=dst_device,
-                data_GB=bytes_total / 1e9,
-            )
-            # P2P.DEFAULT_PHASE is BOUNDARY, which is what we want for
-            # one-shot resharding traffic.
-            ops.append(P2P(logical_transfers=[transfer]))
+            # P2P.DEFAULT_PHASE is BOUNDARY (one-shot resharding traffic).
+            # `total_data_GB` is baked at construction since resharding sizes
+            # are known up-front; `StageBoundary.simulate` reads it via
+            # `NetworkOp.time_simultaneous_system_flow`.
+            ops.append(P2P(
+                endpoint_pairs=[(src_device, dst_device)],
+                total_data_GB=bytes_total / 1e9,
+            ))
         return ops
 
     def _movements_for_param(

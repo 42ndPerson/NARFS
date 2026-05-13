@@ -39,25 +39,38 @@ class NetworkRequirement:
     same-shape collective fires multiple times with *different* sizing —
     most notably DP gradient AllReduce, where each layer's AR carries its
     own parameter byte count. Phases that emit uniformly-sized collectives
-    (TP-AR, EP-AllToAll) leave it `None` and rely on the dedup behavior
-    that's been there since Phase 4a.
+    (TP-AR, EP-AllToAll) leave it `None` and rely on the dedup behavior.
 
-    `data_GB_fn` is a workload-dependent sizing closure evaluated by the
-    simulator before each snapshot (see `ModelMapping.refresh_collective_sizes`).
+    `data_GB_fn` is a workload-dependent sizing closure evaluated at every
+    contention snapshot. It captures architecture parameters at build time
+    and consumes only the runtime ctx. Required: every NetworkRequirement
+    must supply one (use `lambda ctx: <constant>` for static sizes).
     Excluded from equality / hash so two requirements differing only in
     sizing closure still dedupe — same-(kind, group, payload_id)
-    requirements always carry the same closure semantics by construction
-    (both close over the same architecture parameters).
+    requirements always carry the same closure semantics by construction.
+
+    `combine_times` produces the per-op wall time when this requirement's
+    collective overlaps with an operator's kernel time. EXCLUSIVE adds the
+    two times; CONCURRENT interpolates between max(kernel, network) and
+    kernel+network based on `eta` (1.0 = perfect overlap, 0.0 = no overlap).
     """
 
     kind: CollectiveKind
     relation: Relation
     eta: float
     group: ParallelismGroup
-    payload_id: Optional[Hashable] = None
-    data_GB_fn: Optional[Callable[["WorkloadContext"], float]] = field(
-        default=None, compare=False, hash=False
+    data_GB_fn: Callable[["WorkloadContext"], float] = field(
+        compare=False, hash=False, kw_only=True,
     )
+    payload_id: Optional[Hashable] = None
+
+    def combine_times(self, kernel_time: float, network_time: float) -> float:
+        if self.relation is Relation.EXCLUSIVE:
+            return kernel_time + network_time
+        return (
+            (1.0 - self.eta) * (kernel_time + network_time)
+            + self.eta * max(kernel_time, network_time)
+        )
 
 
 @dataclass(frozen=True)

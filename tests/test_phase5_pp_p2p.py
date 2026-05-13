@@ -164,26 +164,28 @@ def test_pp_p2p_forward_goes_pp0_to_pp1_backward_reverses():
     )
     fwd = mm.pp_p2p_op_forward
     bwd = mm.pp_p2p_op_backward
-    assert len(fwd.logical_transfers) == 1
-    assert len(bwd.logical_transfers) == 1
-    fwd_t = fwd.logical_transfers[0]
-    bwd_t = bwd.logical_transfers[0]
-    assert (fwd_t.src_device, fwd_t.dst_device) == (_dev(10), _dev(20))
-    assert (bwd_t.src_device, bwd_t.dst_device) == (_dev(20), _dev(10))
+    assert fwd is not None and bwd is not None
+    assert len(fwd.endpoint_pairs) == 1
+    assert len(bwd.endpoint_pairs) == 1
+    assert fwd.endpoint_pairs[0] == (_dev(10), _dev(20))
+    assert bwd.endpoint_pairs[0] == (_dev(20), _dev(10))
 
 
 # ---- sizing ------------------------------------------------------------------
 
 
-def test_pp_p2p_size_matches_T_h_dtype_after_refresh():
+def test_pp_p2p_size_matches_T_h_dtype_after_resolve():
+    from submesh_mapping import resolve_op_transfers
+
     mm = _make_mapping(
         ParallelismConfig(tp=1, pp=2, dp=1), Workload.TRAINING, [0, 1],
     )
     ctx = _ctx(prompt_len=256, microbatch_size=4)
-    mm.refresh_collective_sizes(ctx)
+    op_transfers = resolve_op_transfers(ctx, [mm])
     fwd = mm.pp_p2p_op_forward
+    assert fwd is not None
     expected_GB = 4 * 256 * SMALL_LLAMA.h * SMALL_LLAMA.dtype_bytes / 1e9
-    assert abs(fwd.logical_transfers[0].data_GB - expected_GB) < 1e-12
+    assert abs(op_transfers[fwd][0].data_GB - expected_GB) < 1e-12
 
 
 def test_pp_p2p_request_dedups_with_payload_id():
@@ -241,11 +243,13 @@ def test_pp_p2p_in_network_ops_dict_for_refresh():
 
 
 def test_pp_p2p_size_scales_with_microbatch_size():
+    from submesh_mapping import resolve_op_transfers
+
     mm = _make_mapping(
         ParallelismConfig(tp=1, pp=2, dp=1), Workload.TRAINING, [0, 1],
     )
-    mm.refresh_collective_sizes(_ctx(prompt_len=128, microbatch_size=2))
-    size_2 = mm.pp_p2p_op_forward.logical_transfers[0].data_GB
-    mm.refresh_collective_sizes(_ctx(prompt_len=128, microbatch_size=4))
-    size_4 = mm.pp_p2p_op_forward.logical_transfers[0].data_GB
+    fwd = mm.pp_p2p_op_forward
+    assert fwd is not None
+    size_2 = resolve_op_transfers(_ctx(prompt_len=128, microbatch_size=2), [mm])[fwd][0].data_GB
+    size_4 = resolve_op_transfers(_ctx(prompt_len=128, microbatch_size=4), [mm])[fwd][0].data_GB
     assert abs(size_4 - 2 * size_2) < 1e-12, (size_2, size_4)

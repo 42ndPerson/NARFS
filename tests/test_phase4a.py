@@ -8,7 +8,6 @@ from model_mapping import ModelMapping
 from network_op import AllReduceRing
 from network_requirement import (
     CollectiveKind,
-    NetworkRequirement,
     ParallelismConfig,
     ParallelismGroup,
 )
@@ -98,14 +97,6 @@ def _ctx(batch: int = 2, prompt_len: int = 64, response_len: int = 8) -> Workloa
 def test_tp2_emits_all_reduce_network_ops_on_correct_shards():
     mm = _make_mapping(Workload.PREPARATION, ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
 
-    ar_req = NetworkRequirement(
-        kind=CollectiveKind.ALL_REDUCE,
-        relation=mm.per_op_network_requirements[0][0].relation
-        if mm.per_op_network_requirements and mm.per_op_network_requirements[0]
-        else None,
-        eta=1.0,
-        group=ParallelismGroup.TP,
-    )
     # Find the single dedup'd AR requirement actually in the dict.
     ar_keys = [
         k for k in mm.network_ops.keys()
@@ -115,10 +106,10 @@ def test_tp2_emits_all_reduce_network_ops_on_correct_shards():
     ar_op = mm.network_ops[ar_keys[0]]
     assert isinstance(ar_op, AllReduceRing)
     # Ring on 2 TP shards → 2 logical transfers (host 0 → 1 → 0).
-    assert len(ar_op.logical_transfers) == 2
+    assert len(ar_op.endpoint_pairs) == 2
     # Verify the transfers reference the TP-group shards (host 0 and host 1).
-    src_hosts = {t.src_device for t in ar_op.logical_transfers}
-    dst_hosts = {t.dst_device for t in ar_op.logical_transfers}
+    src_hosts = {src for src, _ in ar_op.endpoint_pairs}
+    dst_hosts = {dst for _, dst in ar_op.endpoint_pairs}
     assert src_hosts == {_dev(0), _dev(1)}
     assert dst_hosts == {_dev(0), _dev(1)}
 
@@ -134,7 +125,7 @@ def test_tp2_emits_all_reduce_network_ops_on_correct_shards():
 
 def test_simulate_pp1_returns_positive_total_with_empty_transfer_times():
     mm = _make_mapping(Workload.PREPARATION, ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
-    result = mm.simulate(_ctx(), A100, transfer_times_steady={}, transfer_times_boundary={})
+    result = mm.simulate(_ctx(), A100, op_transfers={}, transfer_times_steady={}, transfer_times_boundary={})
     assert result.total_time > 0.0
     assert len(result.pp_stage_times) == 1
 
@@ -149,7 +140,7 @@ def test_simulate_pp2_partition_and_stage_times():
     # Stages should differ by at most 1 op (even-by-count partition).
     assert max(sizes) - min(sizes) <= 1
 
-    result = mm.simulate(_ctx(), A100, transfer_times_steady={}, transfer_times_boundary={})
+    result = mm.simulate(_ctx(), A100, op_transfers={}, transfer_times_steady={}, transfer_times_boundary={})
     assert len(result.pp_stage_times) == 2
     assert result.total_time > 0.0
 
@@ -281,7 +272,7 @@ def test_generation_simulate_returns_prefill_and_decode():
     assert mm.decode_operator_pattern, "decode pattern empty"
 
     ctx = _ctx(batch=1, prompt_len=64, response_len=8)
-    result = mm.simulate(ctx, A100, transfer_times_steady={}, transfer_times_boundary={})
+    result = mm.simulate(ctx, A100, op_transfers={}, transfer_times_steady={}, transfer_times_boundary={})
 
     assert result.prefill_time is not None
     assert result.decode_time is not None

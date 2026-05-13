@@ -10,49 +10,50 @@ from topo import HostTopo
 from workload_context import WorkloadContext
 
 
-def partition_steady_boundary(
-    model_mappings: list[ModelMapping],
-) -> tuple[list[NetworkOp], list[NetworkOp]]:
-    """Split each ModelMapping's NetworkOps by phase (STEADY vs BOUNDARY).
+def resolve_op_transfers(
+    workload_ctx: WorkloadContext, model_mappings: list[ModelMapping]
+) -> dict[NetworkOp, list[LogicalTransfer]]:
+    """Resolve each NetworkOp's current LogicalTransfers against `ctx`.
 
-    Shared by simulate_isolated (this file) and simulate_stage (simulator.py)
-    so both apply the same partitioning rule.
+    For each (req, op) pair in every ModelMapping's `network_ops`, evaluates
+    the requirement's `data_GB_fn(ctx)` to get total bytes, then asks the
+    op to distribute that total across its endpoint pairs. The result is a
+    map from each NetworkOp to its freshly-constructed transfer list —
+    consumed both by the contention-snapshot step and by `CombinedOp.wall_time`.
     """
-    steady: list[NetworkOp] = []
-    boundary: list[NetworkOp] = []
+    out: dict[NetworkOp, list[LogicalTransfer]] = {}
     for mm in model_mappings:
-        for op in mm.network_ops.values():
-            if NetworkOp.phase_of(op) is NetworkPhase.STEADY:
-                steady.append(op)
-            else:
-                boundary.append(op)
-    return steady, boundary
+        for req, op in mm.network_ops.items():
+            total = float(req.data_GB_fn(workload_ctx))
+            out[op] = op.logical_transfers(total)
+    return out
 
 
 def steady_transfer_times(
-    steady_ops: list[NetworkOp], topo: HostTopo
+    op_transfers: dict[NetworkOp, list[LogicalTransfer]],
+    topo: HostTopo,
 ) -> dict[LogicalTransfer, float]:
-    """Per-transfer time under shared-bandwidth contention.
-
-    `topo.get_simultaneous_logical_transfer_times` is the bandwidth→time
-    wrapper around `get_simultaneous_system_shared_bandwidth`, so we get
-    seconds directly.
-    """
-    transfers = [t for op in steady_ops for t in op.logical_transfers]
+    """Per-transfer time under shared-bandwidth contention for steady ops."""
+    transfers = [
+        t for op, ts in op_transfers.items()
+        if NetworkOp.phase_of(op) is NetworkPhase.STEADY
+        for t in ts
+    ]
     if not transfers:
         return {}
     return topo.get_simultaneous_logical_transfer_times(transfers)
 
 
 def boundary_transfer_times(
-    boundary_ops: list[NetworkOp], topo: HostTopo
+    op_transfers: dict[NetworkOp, list[LogicalTransfer]],
+    topo: HostTopo,
 ) -> dict[LogicalTransfer, float]:
-    """Per-transfer time under flow-time contention.
-
-    `topo.get_simultaneous_system_flow_time` returns dict[(src, dst), time];
-    we expand to per-LogicalTransfer for NetworkOp.get_operator_time.
-    """
-    transfers = [t for op in boundary_ops for t in op.logical_transfers]
+    """Per-transfer time under flow-time contention for boundary ops."""
+    transfers = [
+        t for op, ts in op_transfers.items()
+        if NetworkOp.phase_of(op) is NetworkPhase.BOUNDARY
+        for t in ts
+    ]
     if not transfers:
         return {}
     pair_times = topo.get_simultaneous_system_flow_time(transfers)
@@ -76,19 +77,14 @@ class SubmeshMapping:
 
         Cross-submesh contention is silently ignored — steady/boundary
         snapshots are taken against only this submesh's own NetworkOps.
-        Use simulate_stage when stage-wide context is available; this method
-        is intended for early-stage exploration where it isn't.
-
-        Models in the submesh run sequentially per the existing
-        SubmeshMapping definition, so the result is the sum of their times.
+        Use `simulate_stage` when stage-wide context is available.
         """
-        # Phase 1: refresh workload-dependent collective sizes before snapshot.
-        for mm in self.model_mappings:
-            mm.refresh_collective_sizes(workload_ctx)
-        steady_ops, boundary_ops = partition_steady_boundary(self.model_mappings)
-        steady_times = steady_transfer_times(steady_ops, topo)
-        boundary_times = boundary_transfer_times(boundary_ops, topo)
+        op_transfers = resolve_op_transfers(workload_ctx, self.model_mappings)
+        steady_times = steady_transfer_times(op_transfers, topo)
+        boundary_times = boundary_transfer_times(op_transfers, topo)
         return sum(
-            mm.simulate(workload_ctx, hw, steady_times, boundary_times).total_time
+            mm.simulate(
+                workload_ctx, hw, op_transfers, steady_times, boundary_times,
+            ).total_time
             for mm in self.model_mappings
         )

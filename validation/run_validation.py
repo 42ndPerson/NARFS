@@ -198,9 +198,6 @@ def build_model_mapping(scenario: Scenario) -> tuple[ModelMapping, HostTopo]:
         parallelism=scenario.parallelism,
         shards_to_devices=s2d,
         device_to_shard=d2s,
-        # Leaving estimates empty: the validation focuses on operator-level
-        # accuracy, not network sizing. Network ops contribute ~latency only.
-        data_GB_estimates={},
     )
     topo = _topology_for_scenario(scenario, num_hosts)
     return mm, topo

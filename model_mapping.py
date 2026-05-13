@@ -29,7 +29,7 @@ from operators.builders import (
     expand_pattern_with_layers,
 )
 from operators.optimizer import AdamOptimizerOp
-from relation import NetworkAssociation, NetworkPhase, Relation
+from relation import NetworkPhase, Relation
 from shard import Shard
 from topo import Device
 from workload_context import Workload, WorkloadContext
@@ -38,20 +38,18 @@ from workload_context import Workload, WorkloadContext
 @dataclass
 class CombinedOp:
     """One position in a model's execution sequence: the operator at this
-    position plus zero or more `NetworkAssociation`s for collectives that
+    position plus zero or more `NetworkRequirement`s for collectives that
     overlap with the op's kernel time.
 
-    Multiple associations chain through `NetworkAssociation.combine_times`
-    in order — each successive association refines the running wall time.
-    The phase (STEADY vs BOUNDARY) of each association's NetworkOp selects
-    which transfer-times snapshot is consulted.
-
-    `requirements` is kept parallel to `associations` so callers that need
-    to inspect requirement metadata (e.g. count occurrences of TP-AR across
-    the graph) can still do so without holding a separate parallel list.
+    Each requirement's resolved `NetworkOp` is held in the parallel
+    `network_ops` list. Requirements provide the `combine_times` rule
+    (relation + eta) and the `data_GB_fn` closure that sizes the collective
+    against the current ctx. The orchestrator pre-resolves each NetworkOp's
+    current transfers into `op_transfers` and passes that dict to
+    `wall_time` so per-op lookup is O(1).
     """
     operator: Operator
-    associations: list[NetworkAssociation] = field(default_factory=list)
+    network_ops: list[NetworkOp] = field(default_factory=list)
     requirements: list[NetworkRequirement] = field(default_factory=list)
     layer_tag: LayerTag = field(default_factory=LayerTag)
 
@@ -60,15 +58,20 @@ class CombinedOp:
         ctx: WorkloadContext,
         hw: HardwareSpec,
         par: ParallelismConfig,
+        op_transfers: dict[NetworkOp, list[LogicalTransfer]],
         transfer_times_steady: dict[LogicalTransfer, float],
         transfer_times_boundary: dict[LogicalTransfer, float],
     ) -> float:
         wall = self.operator.kernel_time(ctx, hw, par)
-        for assoc in self.associations:
-            phase = NetworkOp.phase_of(assoc.network_op)
-            tt = transfer_times_steady if phase is NetworkPhase.STEADY else transfer_times_boundary
-            net_time = assoc.network_op.get_operator_time(tt)
-            wall = assoc.combine_times(wall, net_time)
+        for net_op, req in zip(self.network_ops, self.requirements):
+            phase = NetworkOp.phase_of(net_op)
+            tt = (
+                transfer_times_steady if phase is NetworkPhase.STEADY
+                else transfer_times_boundary
+            )
+            transfers = op_transfers.get(net_op, [])
+            net_time = net_op.get_operator_time(transfers, tt)
+            wall = req.combine_times(wall, net_time)
         return wall
 
 
@@ -85,8 +88,7 @@ class SimulationResult:
 # Reference HardwareSpec used solely by the layer-aware PP partitioner to
 # compute layer cost ratios. The partition is invariant under uniform
 # rescaling of compute/memory, so the absolute numbers don't matter — only
-# the ratio compute_flops/memory_bytes does. Using A100-class avoids
-# pathological GEMV vs. compute-bound inversions.
+# the ratio compute_flops/memory_bytes does.
 _PARTITION_REF_HW = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
@@ -138,8 +140,8 @@ class ModelMapping:
 
     `__post_init__` builds the model's execution sequence as a list of
     `CombinedOp`s — one per operator position, with each position carrying
-    its overlapping NetworkOps. `simulate(...)` walks the sequence and sums
-    per-position wall times.
+    its overlapping NetworkOps + requirements. `simulate(...)` walks the
+    sequence and sums per-position wall times.
 
     For GENERATION, the prefill and decode patterns are built independently
     via `model.forward_sequence(phase, parallelism)`; each phase's sequence
@@ -153,10 +155,6 @@ class ModelMapping:
     parallelism: ParallelismConfig
     shards_to_devices: dict[Shard, Device]
     device_to_shard: dict[Device, Shard]
-    # Reference data_GB per collective kind for sizing constructed NetworkOps.
-    # Empty dict (default) treats every collective as 0-byte; callers that
-    # want realistic contention populate this with estimated activation sizes.
-    data_GB_estimates: dict["CollectiveKind", float] = field(default_factory=dict)
 
     # Computed in __post_init__:
     forward_seq: list[CombinedOp] = field(init=False, default_factory=list)
@@ -168,6 +166,8 @@ class ModelMapping:
     # backward only in TRAINING. None when pp == 1.
     pp_p2p_op_forward: Optional[NetworkOp] = field(init=False, default=None)
     pp_p2p_op_backward: Optional[NetworkOp] = field(init=False, default=None)
+    pp_p2p_req_forward: Optional[NetworkRequirement] = field(init=False, default=None)
+    pp_p2p_req_backward: Optional[NetworkRequirement] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self._validate_axis_consistency()
@@ -179,7 +179,7 @@ class ModelMapping:
         elif self.workload is Workload.TRAINING:
             self._build_training_seq()
         elif self.workload is Workload.DORMANT:
-            pass  # leaves sequences empty
+            pass
         else:
             raise ValueError(f"Unknown workload: {self.workload!r}")
 
@@ -222,22 +222,12 @@ class ModelMapping:
         return seq, partition
 
     def _build_training_seq(self) -> None:
-        """Build forward + backward + per-layer optimizer with consistent layer tags.
-
-        Forward and backward share `LayerTag`s by construction
-        (`derive_backward_pattern` preserves structural shape). Optimizer ops
-        are emitted one per LayerTag with non-zero per-rank parameters; each
-        carries the same tag so the partitioner co-locates a layer's
-        forward, backward, and optimizer.
-        """
         forward_pattern = self.model.forward_sequence("training", self.parallelism)
         backward_pattern = derive_backward_pattern(forward_pattern, recompute=True)
 
         forward_expanded = expand_pattern_with_layers(forward_pattern)
         backward_expanded = expand_pattern_with_layers(backward_pattern)
 
-        # Aggregate per-rank parameter bytes per LayerTag (optimizer state is
-        # local to each rank).
         params_by_tag: dict[LayerTag, int] = defaultdict(int)
         for (op, _), tag in forward_expanded:
             params_by_tag[tag] += op.parameter_bytes_per_rank(self.parallelism)
@@ -259,29 +249,16 @@ class ModelMapping:
         self,
         expanded: list[tuple[OperatorWithReqs, LayerTag]],
     ) -> list[CombinedOp]:
-        """Materialize `CombinedOp`s from an expanded (op, reqs, tag) stream.
-
-        Resolves each unique `NetworkRequirement` to a NetworkOp once
-        (deduplicated in `self.network_ops`); the resulting `CombinedOp`s
-        carry `NetworkAssociation`s that wrap the resolved NetworkOps with
-        per-position relation/eta from the requirement.
-        """
         seq: list[CombinedOp] = []
         for (op, reqs), tag in expanded:
-            associations: list[NetworkAssociation] = []
+            net_ops: list[NetworkOp] = []
             for req in reqs:
                 if req not in self.network_ops:
                     self.network_ops[req] = self._resolve_network_op(req)
-                associations.append(
-                    NetworkAssociation(
-                        network_op=self.network_ops[req],
-                        relation=req.relation,
-                        eta=req.eta,
-                    )
-                )
+                net_ops.append(self.network_ops[req])
             seq.append(CombinedOp(
                 operator=op,
-                associations=associations,
+                network_ops=net_ops,
                 requirements=list(reqs),
                 layer_tag=tag,
             ))
@@ -290,12 +267,6 @@ class ModelMapping:
     # ----- layer-aware pipeline partition ------------------------------------
 
     def _reference_partition_ctx(self) -> WorkloadContext:
-        """Synthetic reference workload used only for measuring relative layer cost.
-
-        Operators are sized off `microbatch_size × prompt_len` per invocation,
-        so a microbatch_size of 1 keeps the partition stable across the
-        eventual real workload. Only the *ratio* between layer costs matters.
-        """
         return WorkloadContext(
             workload_type=self.workload,
             batch_size=1,
@@ -306,14 +277,6 @@ class ModelMapping:
         )
 
     def _layer_aware_partition(self, seq: list[CombinedOp]) -> list[list[int]]:
-        """Layer-co-locating PP partition.
-
-        CombinedOps sharing a `layer_index` always land on the same stage
-        (real PP keeps a layer's forward and backward on the same hardware).
-        Layers are split into `pp` contiguous groups by min-max cost using
-        per-layer kernel time at a synthetic reference workload. Boundary
-        ops (`anchor="first"` / `"last"`) pin to the first / last stage.
-        """
         pp = max(self.parallelism.pp, 1)
         n = len(seq)
         if pp == 1 or n == 0:
@@ -356,26 +319,6 @@ class ModelMapping:
         out[0] = sorted(first_anchor) + out[0]
         out[-1] = out[-1] + sorted(last_anchor)
         return out
-
-    # ----- collective sizing refresh -----------------------------------------
-
-    def refresh_collective_sizes(self, workload_ctx: WorkloadContext) -> None:
-        """Re-derive each NetworkOp's transfer sizes against the current ctx.
-
-        Called by the simulator at the top of `simulate_stage` /
-        `simulate_isolated` / `simulate_rlhf_iteration`, before contention
-        snapshots are taken. For each unique `NetworkRequirement` in
-        `network_ops`, evaluates its `data_GB_fn(ctx)` (when present) and
-        calls the NetworkOp's `refresh_data_size`. Requirements without a
-        sizing closure fall back to the legacy `data_GB_estimates` dict.
-        """
-        for req, op in self.network_ops.items():
-            fn = req.data_GB_fn
-            if fn is not None:
-                data_GB = float(fn(workload_ctx))
-            else:
-                data_GB = float(self.data_GB_estimates.get(req.kind, 0.0))
-            op.refresh_data_size(data_GB)
 
     # ----- network requirement resolution ------------------------------------
 
@@ -430,12 +373,11 @@ class ModelMapping:
                 )
 
     def _install_pp_p2p_ops(self) -> None:
-        """Build the per-microbatch PP activation P2P ops.
+        """Build the per-microbatch PP activation P2P ops + their requirements.
 
         Forward leg fires every microbatch (any non-dormant workload);
         backward leg only in TRAINING. Sized to microbatch-prefill activation
-        (`microbatch_size * prompt_len * h * dtype`); the closure is
-        evaluated by `refresh_collective_sizes` against the current ctx.
+        (`microbatch_size * prompt_len * h * dtype`).
 
         Phase override is `STEADY`: P2P normally defaults to BOUNDARY (one-
         shot pipeline send/recv at handover boundaries). Here it streams
@@ -450,7 +392,7 @@ class ModelMapping:
         h = getattr(arch, "h", None)
         dtype = getattr(arch, "dtype_bytes", None)
         if h is None or dtype is None:
-            return  # architectures lacking shape — skip
+            return
 
         def _activation_size_fn(ctx: WorkloadContext) -> float:
             T = ctx.microbatch_size * max(ctx.prompt_len, 1)
@@ -465,17 +407,15 @@ class ModelMapping:
             data_GB_fn=_activation_size_fn,
         )
         fwd_op = P2P(
-            logical_transfers=[
-                LogicalTransfer(
-                    src_device=self.shards_to_devices[src],
-                    dst_device=self.shards_to_devices[dst],
-                    data_GB=0.0,
-                )
-            ],
+            endpoint_pairs=[(
+                self.shards_to_devices[src],
+                self.shards_to_devices[dst],
+            )],
             phase=NetworkPhase.STEADY,
         )
         self.network_ops[fwd_req] = fwd_op
         self.pp_p2p_op_forward = fwd_op
+        self.pp_p2p_req_forward = fwd_req
 
         if self.workload is Workload.TRAINING:
             bwd_req = NetworkRequirement(
@@ -487,39 +427,36 @@ class ModelMapping:
                 data_GB_fn=_activation_size_fn,
             )
             bwd_op = P2P(
-                logical_transfers=[
-                    LogicalTransfer(
-                        src_device=self.shards_to_devices[dst],
-                        dst_device=self.shards_to_devices[src],
-                        data_GB=0.0,
-                    )
-                ],
+                endpoint_pairs=[(
+                    self.shards_to_devices[dst],
+                    self.shards_to_devices[src],
+                )],
                 phase=NetworkPhase.STEADY,
             )
             self.network_ops[bwd_req] = bwd_op
             self.pp_p2p_op_backward = bwd_op
+            self.pp_p2p_req_backward = bwd_req
 
     def _resolve_network_op(self, req: NetworkRequirement) -> NetworkOp:
         """Concrete NetworkOp from a declarative requirement.
 
-        data_GB is a placeholder — `refresh_collective_sizes` populates real
-        values against the runtime ctx before each contention snapshot.
+        Builds the structural (src, dst) pairs only — payload sizing is
+        deferred to `op.logical_transfers(total)` at simulate time.
         """
         shards = self._shards_in_group(req.group)
         kind = req.kind
-        data_GB = self.data_GB_estimates.get(kind, 0.0)
         if kind is CollectiveKind.ALL_REDUCE:
-            return AllReduceRing.generate(self, shards, data_GB=data_GB)
+            return AllReduceRing.generate(self, shards)
         if kind is CollectiveKind.ALL_GATHER:
-            return AllGatherRing.generate(self, shards, data_GB=data_GB)
+            return AllGatherRing.generate(self, shards)
         if kind is CollectiveKind.REDUCE_SCATTER:
-            return ReduceScatterRing.generate(self, shards, data_GB=data_GB)
+            return ReduceScatterRing.generate(self, shards)
         if kind in (CollectiveKind.ALL_TO_ALL_DISPATCH, CollectiveKind.ALL_TO_ALL_COMBINE):
-            return AllToAll.generate(self, shards, data_GB=data_GB)
+            return AllToAll.generate(self, shards)
         if kind in (CollectiveKind.P2P_PIPELINE_FORWARD, CollectiveKind.P2P_PIPELINE_BACKWARD):
             if len(shards) < 2:
-                return P2P(logical_transfers=[])
-            return P2P.generate(self, shards[0], shards[1], data_GB=data_GB)
+                return P2P(endpoint_pairs=[])
+            return P2P.generate(self, shards[0], shards[1])
         raise ValueError(f"Unknown CollectiveKind: {kind!r}")
 
     # ----- simulation --------------------------------------------------------
@@ -528,6 +465,7 @@ class ModelMapping:
         self,
         workload_ctx: WorkloadContext,
         hw: HardwareSpec,
+        op_transfers: dict[NetworkOp, list[LogicalTransfer]],
         transfer_times_steady: dict[LogicalTransfer, float],
         transfer_times_boundary: dict[LogicalTransfer, float],
     ) -> SimulationResult:
@@ -535,13 +473,13 @@ class ModelMapping:
             prefill = self._simulate_seq(
                 self.forward_seq, self.pipeline_partition,
                 workload_ctx, hw,
-                transfer_times_steady, transfer_times_boundary,
+                op_transfers, transfer_times_steady, transfer_times_boundary,
                 pipelined=True,
             )
             decode_step = self._simulate_seq(
                 self.decode_seq, self.decode_pipeline_partition,
                 workload_ctx, hw,
-                transfer_times_steady, transfer_times_boundary,
+                op_transfers, transfer_times_steady, transfer_times_boundary,
                 pipelined=False,
             )
             decode_time = decode_step.total_time * max(workload_ctx.response_len, 0)
@@ -559,7 +497,7 @@ class ModelMapping:
         result = self._simulate_seq(
             self.forward_seq, self.pipeline_partition,
             workload_ctx, hw,
-            transfer_times_steady, transfer_times_boundary,
+            op_transfers, transfer_times_steady, transfer_times_boundary,
             pipelined=True,
         )
         if self.workload is Workload.TRAINING:
@@ -577,6 +515,7 @@ class ModelMapping:
         partition: list[list[int]],
         workload_ctx: WorkloadContext,
         hw: HardwareSpec,
+        op_transfers: dict[NetworkOp, list[LogicalTransfer]],
         transfer_times_steady: dict[LogicalTransfer, float],
         transfer_times_boundary: dict[LogicalTransfer, float],
         pipelined: bool,
@@ -587,13 +526,10 @@ class ModelMapping:
         per_op = [
             co.wall_time(
                 workload_ctx, hw, self.parallelism,
-                transfer_times_steady, transfer_times_boundary,
+                op_transfers, transfer_times_steady, transfer_times_boundary,
             )
             for co in seq
         ]
-        # Stage time = sum of per-op walls for ops in that stage. Partition is
-        # an explicit list of indices (layer-aware), so explicit indexing
-        # (not slicing) is required.
         stage_times = [sum(per_op[i] for i in stage) for stage in partition]
 
         if not pipelined or self.parallelism.pp <= 1:
@@ -604,18 +540,20 @@ class ModelMapping:
                 per_op_breakdown=per_op,
             )
 
-        # 1F1B-shaped iteration time. Bubble correction is implicit in
-        # (num_microbatches + pp - 1). The per-microbatch PP activation P2P
-        # (forward + backward in training) adds additively to max_stage —
-        # STEADY-phase overhead per microbatch transition.
         num_microbatches = max(workload_ctx.num_microbatches, 1)
         pp = self.parallelism.pp
         max_stage = max(stage_times)
         p2p_per_mb = 0.0
         if self.pp_p2p_op_forward is not None:
-            p2p_per_mb += self.pp_p2p_op_forward.get_operator_time(transfer_times_steady)
+            transfers = op_transfers.get(self.pp_p2p_op_forward, [])
+            p2p_per_mb += self.pp_p2p_op_forward.get_operator_time(
+                transfers, transfer_times_steady,
+            )
         if self.pp_p2p_op_backward is not None:
-            p2p_per_mb += self.pp_p2p_op_backward.get_operator_time(transfer_times_steady)
+            transfers = op_transfers.get(self.pp_p2p_op_backward, [])
+            p2p_per_mb += self.pp_p2p_op_backward.get_operator_time(
+                transfers, transfer_times_steady,
+            )
         total = (num_microbatches + pp - 1) * (max_stage + p2p_per_mb)
         return SimulationResult(
             total_time=total,
