@@ -3,29 +3,17 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hardware import HardwareSpec
-from network_requirement import ParallelismConfig
 from operator_base import Operator
-from parallelism_role import TPMode
 from workload_context import WorkloadContext
-
-
-def _heads_per_rank(role_tp: TPMode, full_heads: int, tp: int, label: str) -> int:
-    if tp <= 1 or role_tp != TPMode.HEADS_PARALLEL:
-        return full_heads
-    if full_heads % tp != 0:
-        raise ValueError(
-            f"{label} ({full_heads}) not divisible by tp ({tp}) under HEADS_PARALLEL"
-        )
-    return full_heads // tp
 
 
 @dataclass(frozen=True)
 class PrefillAttention(Operator):
     """GQA prefill attention via FlashAttention.
 
-    Shapes are full-model: under HEADS_PARALLEL the operator divides
-    `num_heads` and `num_kv_heads` per rank by `par.tp`. REPLICATED leaves
-    them untouched (Phase-2a back-compat with builders that still pre-divide).
+    Parallelism-pure: shapes are full-model. Under HEADS_PARALLEL the
+    `ParallelismScheme` divides the per-rank kernel time by `par.tp`;
+    the operator itself sees the full head count.
 
     Per request of length l, per query head:
       compute: 2 * l^2 * head_size  (DistServe Appendix A factor)
@@ -46,23 +34,18 @@ class PrefillAttention(Operator):
         # sum_r l_r^2 = microbatch_size * prompt_len^2.
         return ctx.microbatch_size * ctx.prompt_len * ctx.prompt_len
 
-    def _heads(self, par: ParallelismConfig) -> int:
-        return _heads_per_rank(self.parallelism_role.tp, self.num_heads, par.tp, "num_heads")
+    def compute_flops(self, ctx: WorkloadContext) -> float:
+        return 2.0 * self.num_heads * self.head_size * self._t2(ctx)
 
-    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        return 2.0 * self._heads(par) * self.head_size * self._t2(ctx)
-
-    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
+    def memory_bytes(self, ctx: WorkloadContext) -> float:
         return (
-            3.0 * self._heads(par) * self.head_size * self._t2(ctx)
+            3.0 * self.num_heads * self.head_size * self._t2(ctx)
             / self.flash_block_size
             * self.dtype_bytes
         )
 
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
-    ) -> bool:
-        del ctx, hw, par
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+        del ctx, hw
         return False  # FlashAttention prefill is memory-bound on A100/H100
 
 
@@ -71,8 +54,8 @@ class DecodeAttention(Operator):
     """GQA decode attention. Each step processes 1 new query token per request,
     attending over the running KV cache.
 
-    Shapes are full-model under HEADS_PARALLEL the operator divides
-    `num_heads` and `num_kv_heads` per rank by `par.tp`.
+    Parallelism-pure: full head counts. Under HEADS_PARALLEL the scheme
+    divides per-rank arithmetic by `par.tp`.
 
     Per invocation:
       compute: 2 * num_heads * head_size * avg_context_length * microbatch_size
@@ -81,7 +64,7 @@ class DecodeAttention(Operator):
     avg_context_length = prompt_len + response_len/2.
 
     kv_bytes_per_token defaults to 2 * num_kv_heads * head_size * dtype_bytes
-    (full GQA K + V reads, post-shard). MLA overrides this to
+    (full GQA K + V reads). MLA overrides this to
     (d_kv_compress + d_rope) * dtype_bytes.
 
     Always memory-bound on A100/H100 for any reasonable shape.
@@ -105,34 +88,16 @@ class DecodeAttention(Operator):
     def avg_context_length(ctx: WorkloadContext) -> float:
         return ctx.prompt_len + ctx.response_len / 2.0
 
-    def _heads(self, par: ParallelismConfig) -> int:
-        return _heads_per_rank(self.parallelism_role.tp, self.num_heads, par.tp, "num_heads")
-
-    def _kv_bytes_per_rank(self, par: ParallelismConfig) -> float:
-        # __post_init__ guarantees kv_bytes_per_token is set; cast for the type checker.
-        kv_bytes = float(self.kv_bytes_per_token or 0)
-        # Under HEADS_PARALLEL, the per-rank KV-cache footprint shrinks too.
-        if par.tp > 1 and self.parallelism_role.tp == TPMode.HEADS_PARALLEL:
-            if self.num_kv_heads % par.tp != 0:
-                raise ValueError(
-                    f"num_kv_heads ({self.num_kv_heads}) not divisible by tp ({par.tp})"
-                )
-            return kv_bytes / par.tp
-        return kv_bytes
-
-    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
+    def compute_flops(self, ctx: WorkloadContext) -> float:
         return (
-            2.0 * self._heads(par) * self.head_size
+            2.0 * self.num_heads * self.head_size
             * self.avg_context_length(ctx) * ctx.microbatch_size
         )
 
-    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        return (
-            ctx.microbatch_size * self.avg_context_length(ctx) * self._kv_bytes_per_rank(par)
-        )
+    def memory_bytes(self, ctx: WorkloadContext) -> float:
+        kv_bytes = float(self.kv_bytes_per_token or 0)
+        return ctx.microbatch_size * self.avg_context_length(ctx) * kv_bytes
 
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
-    ) -> bool:
-        del ctx, hw, par
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+        del ctx, hw
         return False

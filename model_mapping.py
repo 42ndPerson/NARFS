@@ -1,7 +1,7 @@
 from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from hardware import HardwareSpec
 from mesh import Mesh
@@ -41,6 +41,11 @@ class CombinedOp:
     position plus zero or more `NetworkRequirement`s for collectives that
     overlap with the op's kernel time.
 
+    `compute_time_fn(ctx, hw)` is the per-rank kernel-time closure baked by
+    the parallelism strategy at decoration time — it incorporates the role
+    of this op (TP shard direction, EP sharding) so the simulator core
+    stays parallelism-agnostic.
+
     Each requirement's resolved `NetworkOp` is held in the parallel
     `network_ops` list. Requirements provide the `combine_times` rule
     (relation + eta) and the `data_GB_fn` closure that sizes the collective
@@ -49,6 +54,7 @@ class CombinedOp:
     `wall_time` so per-op lookup is O(1).
     """
     operator: Operator
+    compute_time_fn: Callable[[WorkloadContext, HardwareSpec], float]
     network_ops: list[NetworkOp] = field(default_factory=list)
     requirements: list[NetworkRequirement] = field(default_factory=list)
     layer_tag: LayerTag = field(default_factory=LayerTag)
@@ -57,12 +63,11 @@ class CombinedOp:
         self,
         ctx: WorkloadContext,
         hw: HardwareSpec,
-        par: ParallelismConfig,
         op_transfers: dict[NetworkOp, list[LogicalTransfer]],
         transfer_times_steady: dict[LogicalTransfer, float],
         transfer_times_boundary: dict[LogicalTransfer, float],
     ) -> float:
-        wall = self.operator.kernel_time(ctx, hw, par)
+        wall = self.compute_time_fn(ctx, hw)
         for net_op, req in zip(self.network_ops, self.requirements):
             phase = NetworkOp.phase_of(net_op)
             tt = (
@@ -233,6 +238,10 @@ class ModelMapping:
     def _build_training_seq_from_pattern(self) -> None:
         """Training: take the strategy-decorated forward pattern, derive
         backward + per-layer Adam, then build the CombinedOp sequence.
+
+        Adam is sized from the strategy's pre-computed
+        `per_rank_parameter_bytes` on the forward decoration — the operators
+        themselves are parallelism-pure and only know full-model footprints.
         """
         forward_pattern = self.forward_pattern
         backward_pattern = derive_backward_pattern(forward_pattern, recompute=True)
@@ -241,8 +250,8 @@ class ModelMapping:
         backward_expanded = expand_pattern_with_layers(backward_pattern)
 
         params_by_tag: dict[LayerTag, int] = defaultdict(int)
-        for (op, _), tag in forward_expanded:
-            params_by_tag[tag] += op.parameter_bytes_per_rank(self.parallelism)
+        for member, tag in forward_expanded:
+            params_by_tag[tag] += member.per_rank_parameter_bytes
 
         dtype_bytes_param = 2
         optimizer_expanded: list[tuple[OperatorWithReqs, LayerTag]] = []
@@ -251,7 +260,13 @@ class ModelMapping:
                 continue
             num_params = total_param_bytes // dtype_bytes_param
             opt = AdamOptimizerOp(num_parameters=num_params, dtype_bytes_param=dtype_bytes_param)
-            optimizer_expanded.append(((opt, []), tag))
+            entry = OperatorWithReqs(
+                operator=opt,
+                requirements=[],
+                compute_time_fn=lambda ctx, hw, _o=opt: _o.kernel_time(ctx, hw),
+                per_rank_parameter_bytes=0,
+            )
+            optimizer_expanded.append((entry, tag))
 
         full = forward_expanded + backward_expanded + optimizer_expanded
         self.forward_seq = self._expanded_to_seq(full)
@@ -262,16 +277,17 @@ class ModelMapping:
         expanded: list[tuple[OperatorWithReqs, LayerTag]],
     ) -> list[CombinedOp]:
         seq: list[CombinedOp] = []
-        for (op, reqs), tag in expanded:
+        for member, tag in expanded:
             net_ops: list[NetworkOp] = []
-            for req in reqs:
+            for req in member.requirements:
                 if req not in self.network_ops:
                     self.network_ops[req] = self._resolve_network_op(req)
                 net_ops.append(self.network_ops[req])
             seq.append(CombinedOp(
-                operator=op,
+                operator=member.operator,
+                compute_time_fn=member.compute_time_fn,
                 network_ops=net_ops,
-                requirements=list(reqs),
+                requirements=list(member.requirements),
                 layer_tag=tag,
             ))
         return seq
@@ -315,7 +331,7 @@ class ModelMapping:
         layer_costs: list[float] = []
         for lidx in layer_indices_sorted:
             cost = sum(
-                seq[i].operator.kernel_time(ref_ctx, _PARTITION_REF_HW, self.parallelism)
+                seq[i].compute_time_fn(ref_ctx, _PARTITION_REF_HW)
                 for i in indices_by_layer[lidx]
             )
             layer_costs.append(cost)
@@ -537,7 +553,7 @@ class ModelMapping:
 
         per_op = [
             co.wall_time(
-                workload_ctx, hw, self.parallelism,
+                workload_ctx, hw,
                 op_transfers, transfer_times_steady, transfer_times_boundary,
             )
             for co in seq

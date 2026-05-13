@@ -3,9 +3,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from hardware import HardwareSpec
-from network_requirement import ParallelismConfig
 from operator_base import Operator
-from parallelism_role import TPMode
 from workload_context import TokenCount, WorkloadContext
 
 
@@ -30,10 +28,8 @@ def _check_t_source(
 
 @dataclass(frozen=True)
 class RMSNorm(Operator):
-    """Operates on the full hidden state (after upstream AR), so default role
-    is REPLICATED. If a builder marks this COLUMN_PARALLEL it would shard
-    `hidden_size` across TP, but Llama / V3 don't currently use that path.
-    """
+    """Operates on the full hidden state (after upstream AR). Parallelism-pure:
+    sized to the full hidden_size; the scheme divides per-rank kernel time."""
 
     hidden_size: int
     token_count: Optional[TokenCount] = None
@@ -46,32 +42,22 @@ class RMSNorm(Operator):
     def _t(self, ctx: WorkloadContext) -> float:
         return _resolve_t(ctx, self.token_count, self.derive_t)
 
-    def _hidden(self, par: ParallelismConfig) -> int:
-        if par.tp > 1 and self.parallelism_role.tp == TPMode.COLUMN_PARALLEL:
-            if self.hidden_size % par.tp != 0:
-                raise ValueError(
-                    f"RMSNorm.hidden_size ({self.hidden_size}) not divisible by tp ({par.tp})"
-                )
-            return self.hidden_size // par.tp
-        return self.hidden_size
+    def compute_flops(self, ctx: WorkloadContext) -> float:
+        return 5.0 * self._t(ctx) * self.hidden_size
 
-    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        return 5.0 * self._t(ctx) * self._hidden(par)
+    def memory_bytes(self, ctx: WorkloadContext) -> float:
+        return 2.0 * self._t(ctx) * self.hidden_size * self.dtype_bytes
 
-    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        return 2.0 * self._t(ctx) * self._hidden(par) * self.dtype_bytes
-
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
-    ) -> bool:
-        del ctx, hw, par
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+        del ctx, hw
         return False
 
 
 @dataclass(frozen=True)
 class SwiGLUActivation(Operator):
-    """Elementwise on the FFN intermediate. Under COLUMN_PARALLEL it splits
-    `intermediate_size` per rank — follows the column-parallel gate/up GEMMs."""
+    """Elementwise on the FFN intermediate. Parallelism-pure: sized to the
+    full intermediate_size; the scheme divides per-rank kernel time under
+    COLUMN_PARALLEL."""
 
     intermediate_size: int
     token_count: Optional[TokenCount] = None
@@ -84,26 +70,14 @@ class SwiGLUActivation(Operator):
     def _t(self, ctx: WorkloadContext) -> float:
         return _resolve_t(ctx, self.token_count, self.derive_t)
 
-    def _intermediate(self, par: ParallelismConfig) -> int:
-        if par.tp > 1 and self.parallelism_role.tp == TPMode.COLUMN_PARALLEL:
-            if self.intermediate_size % par.tp != 0:
-                raise ValueError(
-                    f"SwiGLUActivation.intermediate_size ({self.intermediate_size}) "
-                    f"not divisible by tp ({par.tp})"
-                )
-            return self.intermediate_size // par.tp
-        return self.intermediate_size
+    def compute_flops(self, ctx: WorkloadContext) -> float:
+        return 2.0 * self._t(ctx) * self.intermediate_size
 
-    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        return 2.0 * self._t(ctx) * self._intermediate(par)
+    def memory_bytes(self, ctx: WorkloadContext) -> float:
+        return 3.0 * self._t(ctx) * self.intermediate_size * self.dtype_bytes
 
-    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        return 3.0 * self._t(ctx) * self._intermediate(par) * self.dtype_bytes
-
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
-    ) -> bool:
-        del ctx, hw, par
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+        del ctx, hw
         return False
 
 
@@ -112,8 +86,8 @@ class RoPE(Operator):
     """Rotary position embedding, applied to Q (n_q heads) and K (n_kv heads).
 
     `num_heads` is the total number of heads being rotated — pass the
-    full-model n_q + n_kv. Under HEADS_PARALLEL the operator divides per
-    rank by `par.tp`.
+    full-model n_q + n_kv. Parallelism-pure: the scheme divides per-rank
+    kernel time under HEADS_PARALLEL.
     """
 
     num_heads: int
@@ -129,23 +103,12 @@ class RoPE(Operator):
     def _t(self, ctx: WorkloadContext) -> float:
         return _resolve_t(ctx, self.token_count, self.derive_t)
 
-    def _heads(self, par: ParallelismConfig) -> int:
-        if par.tp > 1 and self.parallelism_role.tp == TPMode.HEADS_PARALLEL:
-            if self.num_heads % par.tp != 0:
-                raise ValueError(
-                    f"RoPE.num_heads ({self.num_heads}) not divisible by tp ({par.tp})"
-                )
-            return self.num_heads // par.tp
-        return self.num_heads
+    def compute_flops(self, ctx: WorkloadContext) -> float:
+        return 6.0 * self._t(ctx) * self.num_heads * self.rope_dim
 
-    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        return 6.0 * self._t(ctx) * self._heads(par) * self.rope_dim
+    def memory_bytes(self, ctx: WorkloadContext) -> float:
+        return 2.0 * self._t(ctx) * self.num_heads * self.rope_dim * self.dtype_bytes
 
-    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        return 2.0 * self._t(ctx) * self._heads(par) * self.rope_dim * self.dtype_bytes
-
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
-    ) -> bool:
-        del ctx, hw, par
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+        del ctx, hw
         return False

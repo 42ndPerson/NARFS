@@ -25,11 +25,11 @@ The legacy names `ParallelismStrategy` and `MegatronStrategy` are aliases
 for backwards compatibility.
 """
 from __future__ import annotations
-import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from hardware import HardwareSpec
 from mesh import Mesh
 from model import Model
 from model_mapping import ModelMapping
@@ -52,7 +52,7 @@ from parallelism_role import EPMode, ParallelismRole, TPMode
 from relation import Relation
 from shard import Shard
 from topo import Device, HostTopo
-from workload_context import TokenCount, Workload
+from workload_context import TokenCount, Workload, WorkloadContext
 
 
 # Canonical role aliases used by Megatron-family schemes.
@@ -127,6 +127,66 @@ _MEGATRON_LABELS: dict[str, _Decoration] = {
     "moe_shared_swiglu":_Decoration(role=_COL),
     "moe_shared_down":  _Decoration(role=_ROW, collective=_TP_AR),
 }
+
+
+# ---- per-rank baking (role → kernel-time / param-byte scaling) -------------
+
+
+def _tp_divides_compute(role_tp: TPMode) -> bool:
+    return role_tp in (
+        TPMode.COLUMN_PARALLEL,
+        TPMode.ROW_PARALLEL,
+        TPMode.HEADS_PARALLEL,
+        TPMode.VOCAB_PARALLEL,
+    )
+
+
+def _make_compute_time_fn(
+    op: Operator, role: ParallelismRole, par: ParallelismConfig
+):
+    """Per-rank kernel time closure for `op` under `role` and `par`.
+
+    Approximation: per-rank time = full-model `kernel_time` divided by the
+    TP factor when the role shards along TP. EP doesn't divide per-call
+    compute since the operator is sized to a single bottleneck expert. The
+    full-shape kernel still drives GEMV / small-dim tier selection — that's
+    the ±30% asymmetry we accept in Phase 2c (per-rank tile shape under
+    COL vs ROW parallel isn't modeled).
+    """
+    tp_factor = par.tp if par.tp > 1 and _tp_divides_compute(role.tp) else 1
+    if tp_factor == 1:
+        return lambda ctx, hw: op.kernel_time(ctx, hw)
+    return lambda ctx, hw: op.kernel_time(ctx, hw) / tp_factor
+
+
+def _per_rank_parameter_bytes(
+    op: Operator, role: ParallelismRole, par: ParallelismConfig,
+) -> int:
+    """Per-rank weight footprint after applying the role's TP / EP shards.
+
+    Schemes shard weights along whichever TP axis is set (COL, ROW, HEADS,
+    VOCAB) and along EP for routed experts. Validates divisibility at the
+    full-parameter level via the same factor — a misalignment yields a
+    fractional per-rank count which we surface as a ValueError.
+    """
+    full = op.parameter_bytes()
+    if full == 0:
+        return 0
+    if par.tp > 1 and _tp_divides_compute(role.tp):
+        if full % par.tp != 0:
+            raise ValueError(
+                f"per_rank_parameter_bytes: full={full} not divisible by tp={par.tp} "
+                f"for op {type(op).__name__} under role.tp={role.tp.name}"
+            )
+        full //= par.tp
+    if par.ep > 1 and role.ep == EPMode.EXPERT_PARALLEL:
+        if full % par.ep != 0:
+            raise ValueError(
+                f"per_rank_parameter_bytes: full={full} not divisible by ep={par.ep} "
+                f"for op {type(op).__name__} under role.ep={role.ep.name}"
+            )
+        full //= par.ep
+    return full
 
 
 # ---- size closures (architecture-agnostic) ---------------------------------
@@ -381,10 +441,14 @@ class MegatronScheme(ParallelismScheme):
                 ]
                 if phase == "training" and self.parallelism.dp > 1:
                     template_labels = tuple(m.label for m in item.members)
-                    template_ops = [op for op, _ in decorated_members]
-                    dp_ar = self._dp_grad_all_reduce(template_ops, template_labels)
-                    last_op, last_reqs = decorated_members[-1]
-                    decorated_members[-1] = (last_op, last_reqs + [dp_ar])
+                    dp_ar = self._dp_grad_all_reduce(decorated_members, template_labels)
+                    last = decorated_members[-1]
+                    decorated_members[-1] = OperatorWithReqs(
+                        operator=last.operator,
+                        requirements=last.requirements + [dp_ar],
+                        compute_time_fn=last.compute_time_fn,
+                        per_rank_parameter_bytes=last.per_rank_parameter_bytes,
+                    )
                 out.append(LayerRepeat(item.count, decorated_members))
             elif isinstance(item, LabeledOp):
                 out.append(self._decorate_op(item, arch, tc))
@@ -403,13 +467,18 @@ class MegatronScheme(ParallelismScheme):
             raise ValueError(
                 f"MegatronScheme: no decoration rule for label {labeled.label!r}"
             )
-        op = dataclasses.replace(labeled.operator, parallelism_role=dec.role)
+        op = labeled.operator
         reqs: list[NetworkRequirement] = []
         if dec.collective is not None:
             req = self._emit_collective(dec.collective, arch, tc)
             if req is not None:
                 reqs.append(req)
-        return (op, reqs)
+        return OperatorWithReqs(
+            operator=op,
+            requirements=reqs,
+            compute_time_fn=_make_compute_time_fn(op, dec.role, self.parallelism),
+            per_rank_parameter_bytes=_per_rank_parameter_bytes(op, dec.role, self.parallelism),
+        )
 
     def _emit_collective(
         self, kind_tag: str, arch, tc: TokenCount
@@ -457,11 +526,9 @@ class MegatronScheme(ParallelismScheme):
         raise ValueError(f"Unknown collective tag: {kind_tag!r}")
 
     def _dp_grad_all_reduce(
-        self, layer_ops: list[Operator], template_labels: tuple,
+        self, layer_members: list[OperatorWithReqs], template_labels: tuple,
     ) -> NetworkRequirement:
-        total_GB = sum(
-            op.parameter_bytes_per_rank(self.parallelism) for op in layer_ops
-        ) / 1e9
+        total_GB = sum(m.per_rank_parameter_bytes for m in layer_members) / 1e9
         return NetworkRequirement(
             kind=CollectiveKind.ALL_REDUCE,
             relation=Relation.EXCLUSIVE,

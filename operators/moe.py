@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Callable
 
 from hardware import HardwareSpec
-from network_requirement import ParallelismConfig
 from operator_base import Operator
 from operators.elementwise import SwiGLUActivation
 from operators.gemm import Gemm
@@ -30,18 +29,16 @@ MOE_SHARED_DOWN = "moe_shared_down"
 class DispatchMarker(Operator):
     """Zero-cost attachment point for the dispatch all-to-all."""
 
-    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        del ctx, par
+    def compute_flops(self, ctx: WorkloadContext) -> float:
+        del ctx
         return 0.0
 
-    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        del ctx, par
+    def memory_bytes(self, ctx: WorkloadContext) -> float:
+        del ctx
         return 0.0
 
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
-    ) -> bool:
-        del ctx, hw, par
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+        del ctx, hw
         return False
 
 
@@ -49,18 +46,16 @@ class DispatchMarker(Operator):
 class CombineMarker(Operator):
     """Zero-cost attachment point for the combine all-to-all."""
 
-    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        del ctx, par
+    def compute_flops(self, ctx: WorkloadContext) -> float:
+        del ctx
         return 0.0
 
-    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        del ctx, par
+    def memory_bytes(self, ctx: WorkloadContext) -> float:
+        del ctx
         return 0.0
 
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
-    ) -> bool:
-        del ctx, hw, par
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+        del ctx, hw
         return False
 
 

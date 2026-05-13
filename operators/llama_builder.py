@@ -53,14 +53,10 @@ def _phase_to_token_count(phase: str) -> TokenCount:
 def build_llama_layer(arch: LlamaConfig, phase: str) -> list[LabeledOp]:
     """One Llama decoder layer as a flat list of LabeledOps.
 
-    Operators carry full-model shapes. Sharding roles are NOT set here —
-    a parallelism strategy decorates them later based on labels. Per-rank
-    division is handled at the operator level via `parallelism_role` set
-    by the strategy.
-
-    (Phase 2c will strip `parallelism_role` from operators entirely; for
-    now the operators still default to REPLICATED and strategies override
-    via construction.)
+    Operators carry full-model shapes and are parallelism-pure. The
+    strategy decorates the labeled list with sharding roles and collective
+    requirements externally and bakes per-rank arithmetic into the
+    CombinedOp closure.
     """
     tc = _phase_to_token_count(phase)
     qkv_n = (arch.n_q + 2 * arch.n_kv) * arch.head_size

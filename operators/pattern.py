@@ -1,9 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Callable, NamedTuple, Optional, Union
 
+from hardware import HardwareSpec
 from network_requirement import NetworkRequirement
 from operator_base import Operator
+from workload_context import WorkloadContext
 
 
 @dataclass(frozen=True)
@@ -21,9 +23,23 @@ class LabeledOp:
     operator: Operator
 
 
-# An operator paired with the network requirements emitted at this position.
-# Produced by the Strategy after walking the LabeledOp pattern.
-OperatorWithReqs = tuple[Operator, list[NetworkRequirement]]
+class OperatorWithReqs(NamedTuple):
+    """A parallelism-pure operator paired with the strategy's per-rank
+    decoration. Produced by the Strategy after walking the LabeledOp
+    pattern.
+
+    - `operator`: the parallelism-agnostic operator (full-model shapes).
+    - `requirements`: collectives that overlap with this op's kernel time.
+    - `compute_time_fn(ctx, hw)`: per-rank kernel time. The strategy bakes
+      the role-aware division (typically `op.kernel_time(ctx, hw) / tp`).
+    - `per_rank_parameter_bytes`: per-rank weight footprint after the
+      scheme's role (used by DP-AR sizing and Adam optimizer sizing).
+    """
+
+    operator: Operator
+    requirements: list[NetworkRequirement]
+    compute_time_fn: Callable[[WorkloadContext, HardwareSpec], float]
+    per_rank_parameter_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -145,8 +161,8 @@ def split_pattern(
             ops.append(item.operator)
             reqs.append([])
         else:
-            ops.append(item[0])
-            reqs.append(item[1])
+            ops.append(item.operator)
+            reqs.append(item.requirements)
     return ops, reqs
 
 
@@ -154,7 +170,7 @@ def split_pattern_with_layers(
     expanded: list[tuple[OperatorWithReqs, LayerTag]],
 ) -> tuple[list[Operator], list[list[NetworkRequirement]], list[LayerTag]]:
     """Split parallel lists from `expand_pattern_with_layers` output."""
-    ops: list[Operator] = [t[0][0] for t in expanded]
-    reqs: list[list[NetworkRequirement]] = [t[0][1] for t in expanded]
+    ops: list[Operator] = [t[0].operator for t in expanded]
+    reqs: list[list[NetworkRequirement]] = [t[0].requirements for t in expanded]
     tags: list[LayerTag] = [t[1] for t in expanded]
     return ops, reqs, tags

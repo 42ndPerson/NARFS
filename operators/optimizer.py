@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from hardware import HardwareSpec
-from network_requirement import ParallelismConfig
 from operator_base import Operator
 from workload_context import WorkloadContext
 
@@ -14,8 +13,7 @@ class AdamOptimizerOp(Operator):
     Sized to a single layer's (or boundary group's) parameter count when used
     inside the layer-aware pipeline partition: ModelMapping emits one
     AdamOptimizerOp per `LayerTag` so each PP stage runs the optimizer for
-    the parameters it owns. The single-AdamOptimizerOp-for-the-whole-step
-    variant is no longer used.
+    the parameters it owns.
 
     compute_flops:  8 * num_parameters  (m,v update, bias correction, param step)
     memory_bytes:   read params + grads + 2 state moments,
@@ -29,19 +27,17 @@ class AdamOptimizerOp(Operator):
     dtype_bytes_param: int = 2
     dtype_bytes_state: int = 4
 
-    def compute_flops(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        del ctx, par
+    def compute_flops(self, ctx: WorkloadContext) -> float:
+        del ctx
         return 8.0 * self.num_parameters
 
-    def memory_bytes(self, ctx: WorkloadContext, par: ParallelismConfig) -> float:
-        del ctx, par
+    def memory_bytes(self, ctx: WorkloadContext) -> float:
+        del ctx
         return float(
             (2 * self.dtype_bytes_param + 3 * self.dtype_bytes_state)
             * self.num_parameters
         )
 
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec, par: ParallelismConfig
-    ) -> bool:
-        del ctx, hw, par
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
+        del ctx, hw
         return False

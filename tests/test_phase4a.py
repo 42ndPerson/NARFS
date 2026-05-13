@@ -137,8 +137,8 @@ def test_training_includes_backward_and_per_layer_optimizer():
     # Spot-check 3x scaling on a backward op: pick one and compare to its forward.
     sample = backward_ops[0]
     ctx = _ctx()
-    fwd_flops = sample.forward.compute_flops(ctx, mm.parallelism)
-    bwd_flops = sample.compute_flops(ctx, mm.parallelism)
+    fwd_flops = sample.forward.compute_flops(ctx)
+    bwd_flops = sample.compute_flops(ctx)
     if fwd_flops > 0:
         assert bwd_flops == pytest.approx(3.0 * fwd_flops)
 
@@ -206,11 +206,12 @@ def test_pp_partition_v3_balances_cost():
     )
 
     # Compute per-stage cost at the reference workload the partitioner used.
+    # Use the strategy-baked compute_time_fn on each CombinedOp (per-rank).
     from model_mapping import _PARTITION_REF_HW
     ref_ctx = mm._reference_partition_ctx()
     stage_costs = [
         sum(
-            mm.operator_pattern[i].kernel_time(ref_ctx, _PARTITION_REF_HW, mm.parallelism)
+            mm.forward_seq[i].compute_time_fn(ref_ctx, _PARTITION_REF_HW)
             for i in op_indices
         )
         for op_indices in mm.pipeline_partition

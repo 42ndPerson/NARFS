@@ -1,16 +1,23 @@
-"""Phase 3 (updated for the strategy-based architecture):
-TP-sharded operator shapes + LM-head AllGather.
+"""Phase 3 (updated for Phase 2c — parallelism-pure operators):
+strategy-applied TP sharding + LM-head AllGather.
 
-The architecture's `forward_sequence` emits labeled operators with NO
-sharding decisions. The strategy decorates each operator with its
-`parallelism_role` and attaches collectives (TP-AR, TP-AG, EP-AllToAll)
-based on labels. These tests inspect the *strategy-decorated* pattern,
-which is what ModelMapping ultimately consumes.
+After Phase 2c the operator no longer carries a `parallelism_role` or
+exposes role-aware `_shape` / `_heads` helpers. The strategy stores its
+sharding decisions externally via `OperatorWithReqs.compute_time_fn`
+(per-rank kernel-time closure) and `per_rank_parameter_bytes` (per-rank
+weight footprint). These tests pin the *outcome* of sharding — that the
+per-rank footprint and kernel time at TP=4 are 1/4 of TP=1 for sharded
+operators — and pin the LM-head AllGather requirement.
+
+Direction-of-shard distinctions (COL vs ROW vs HEADS) are no longer visible
+at the operator level; that's the acknowledged ±30% approximation in
+Phase 2c (per-rank tile shape asymmetry isn't modeled).
 """
 from __future__ import annotations
 
 import pytest
 
+from hardware import HardwareSpec
 from network_requirement import (
     CollectiveKind,
     NetworkRequirement,
@@ -21,7 +28,7 @@ from operators.attention import DecodeAttention
 from operators.gemm import Gemm
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
-from operators.pattern import expand_tagged_pattern, split_pattern
+from operators.pattern import LabeledOp, expand_tagged_pattern
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
 from strategies import MegatronStrategy
@@ -38,6 +45,13 @@ SMALL_LLAMA = LlamaConfig(
 )
 
 
+_HW = HardwareSpec(
+    peak_compute_flops=312e12,
+    peak_memory_bandwidth=2.0e12,
+    ridge_flops_per_byte=156.0,
+)
+
+
 def _dev(i: int) -> Device:
     return Device(host_id=i, gpu_id=0)
 
@@ -50,64 +64,66 @@ def _ctx(prompt_len: int = 128) -> WorkloadContext:
     )
 
 
-def _llama_decorated(par: ParallelismConfig, phase: str = "prefill"):
-    """Strategy-decorated pattern for SMALL_LLAMA at given parallelism."""
+def _llama_entries(par: ParallelismConfig, phase: str = "prefill"):
     model = LlamaModel(name="t", role="actor", architecture=SMALL_LLAMA)
-    return MegatronStrategy(par).decorated_pattern(model, phase)
+    pattern = MegatronStrategy(par).decorated_pattern(model, phase)
+    return [e for e in expand_tagged_pattern(pattern) if not isinstance(e, LabeledOp)]
 
 
-def _v3_decorated(cfg: V3Config, par: ParallelismConfig, phase: str = "prefill"):
-    """Strategy-decorated pattern for given V3Config + parallelism."""
+def _v3_entries(cfg: V3Config, par: ParallelismConfig, phase: str = "prefill"):
     model = V3Model(name="t", role="actor", architecture=cfg)
-    return MegatronStrategy(par).decorated_pattern(model, phase)
+    pattern = MegatronStrategy(par).decorated_pattern(model, phase)
+    return [e for e in expand_tagged_pattern(pattern) if not isinstance(e, LabeledOp)]
 
 
-# ---- MLA TP-sharding (now via strategy) -------------------------------------
+# ---- MLA TP-sharding (now via strategy, observed through per_rank_parameter_bytes) -----
 
 
 def test_mla_q_up_kv_up_attn_out_shrink_under_tp():
-    """The strategy applies COLUMN_PARALLEL to q_up/kv_up and ROW_PARALLEL
-    to attn_out, so their per-rank shapes shrink by tp.
-    """
+    """q_up / kv_up (COL) and attn_out (ROW) all shrink per-rank param bytes
+    by tp under the strategy's role assignment."""
     cfg = V3Config()
     tp = 4
-    par = ParallelismConfig(tp=tp)
-    pattern = _v3_decorated(cfg, par)
-    # Expand the pattern and find the relevant ops by their architectural shape.
-    expanded = expand_tagged_pattern(pattern)
-    ops, _ = split_pattern(expanded)
+    entries = _v3_entries(cfg, ParallelismConfig(tp=tp))
 
-    # Find q_up: Gemm with n = n_h * (head_size + d_rope)
     expected_q_up_n = cfg.n_h * (cfg.head_size + cfg.d_rope)
-    q_up = next(o for o in ops if isinstance(o, Gemm) and o.n == expected_q_up_n)
-    n_eff, _ = q_up._shape(par)
-    assert n_eff == expected_q_up_n // tp
-
-    # kv_up: Gemm with n = n_h * 2 * head_size
-    expected_kv_up_n = cfg.n_h * 2 * cfg.head_size
-    kv_up = next(o for o in ops if isinstance(o, Gemm) and o.n == expected_kv_up_n)
-    n_eff, _ = kv_up._shape(par)
-    assert n_eff == expected_kv_up_n // tp
-
-    # attn_out: Gemm with k = n_h * head_size, n = cfg.h, ROW_PARALLEL
-    expected_attn_out_k = cfg.n_h * cfg.head_size
-    attn_out = next(
-        o for o in ops
-        if isinstance(o, Gemm) and o.k == expected_attn_out_k and o.n == cfg.h
+    q_up_entry = next(
+        e for e in entries
+        if isinstance(e.operator, Gemm) and e.operator.n == expected_q_up_n
     )
-    _, k_eff = attn_out._shape(par)
-    assert k_eff == expected_attn_out_k // tp
+    assert q_up_entry.per_rank_parameter_bytes == q_up_entry.operator.parameter_bytes() // tp
+
+    expected_kv_up_n = cfg.n_h * 2 * cfg.head_size
+    kv_up_entry = next(
+        e for e in entries
+        if isinstance(e.operator, Gemm) and e.operator.n == expected_kv_up_n
+    )
+    assert kv_up_entry.per_rank_parameter_bytes == kv_up_entry.operator.parameter_bytes() // tp
+
+    expected_attn_out_k = cfg.n_h * cfg.head_size
+    attn_out_entry = next(
+        e for e in entries
+        if isinstance(e.operator, Gemm)
+        and e.operator.k == expected_attn_out_k and e.operator.n == cfg.h
+    )
+    assert attn_out_entry.per_rank_parameter_bytes == attn_out_entry.operator.parameter_bytes() // tp
 
 
-def test_mla_attention_uses_local_head_count():
-    """Strategy applies HEADS_PARALLEL to attention; per-rank head count = n_h / tp."""
+def test_mla_attention_per_rank_kernel_time_shrinks_under_tp():
+    """HEADS_PARALLEL attention: per-rank kernel time at tp=2 is half of tp=1."""
     cfg = V3Config()
-    par = ParallelismConfig(tp=2)
-    pattern = _v3_decorated(cfg, par, phase="decode")
-    ops, _ = split_pattern(expand_tagged_pattern(pattern))
-    attn = next(o for o in ops if isinstance(o, DecodeAttention))
-    assert attn.num_heads == cfg.n_h
-    assert attn._heads(par) == cfg.n_h // 2
+    ctx = _ctx(prompt_len=128)
+
+    tp1 = next(
+        e for e in _v3_entries(cfg, ParallelismConfig(tp=1), phase="decode")
+        if isinstance(e.operator, DecodeAttention)
+    )
+    tp2 = next(
+        e for e in _v3_entries(cfg, ParallelismConfig(tp=2), phase="decode")
+        if isinstance(e.operator, DecodeAttention)
+    )
+    assert tp2.operator.num_heads == cfg.n_h  # operator stores full count
+    assert tp2.compute_time_fn(ctx, _HW) == pytest.approx(tp1.compute_time_fn(ctx, _HW) / 2)
 
 
 def test_strategy_rejects_nondivisible_n_h():
@@ -129,22 +145,16 @@ def test_strategy_rejects_nondivisible_n_h():
 def test_v3_dense_ffn_intermediate_shrinks_under_tp():
     cfg = V3Config()
     tp = 4
-    par = ParallelismConfig(tp=tp)
-    pattern = _v3_decorated(cfg, par, phase="prefill")
-    ops, _ = split_pattern(expand_tagged_pattern(pattern))
-    # ffn_down: Gemm with n = cfg.h, k = cfg.m_dense (full shape).
-    ffn_down = next(
-        o for o in ops
-        if isinstance(o, Gemm) and o.n == cfg.h and o.k == cfg.m_dense
+    entries = _v3_entries(cfg, ParallelismConfig(tp=tp))
+    ffn_down_entry = next(
+        e for e in entries
+        if isinstance(e.operator, Gemm)
+        and e.operator.n == cfg.h and e.operator.k == cfg.m_dense
     )
-    _, k_eff = ffn_down._shape(par)
-    assert k_eff == cfg.m_dense // tp
+    assert ffn_down_entry.per_rank_parameter_bytes == ffn_down_entry.operator.parameter_bytes() // tp
 
 
 def test_strategy_rejects_nondivisible_m_dense():
-    # Construct V3 where only m_dense fails the tp=2 check (everything else
-    # divides). m_dense=99 isn't divisible by 2; vocab/n_h/m_expert defaults
-    # are powers-of-2-compatible.
     cfg = V3Config(m_dense=99)
     par = ParallelismConfig(tp=2)
     model = V3Model(name="t", role="actor", architecture=cfg)
@@ -159,36 +169,37 @@ def test_strategy_rejects_nondivisible_m_dense():
 # ---- V3 MoE shared expert ----------------------------------------------------
 
 
-def test_v3_moe_shared_expert_shrinks_under_tp_routed_unchanged():
+def test_v3_moe_shared_expert_shrinks_under_tp_routed_ep_only():
+    """Routed experts shard along EP only — TP role is REPLICATED so per-rank
+    parameter bytes do NOT divide by tp. Shared experts use COL/ROW under TP
+    so they DO shrink by tp.
+    """
     cfg = V3Config()
     tp = 4
     par = ParallelismConfig(tp=tp)
-    pattern = _v3_decorated(cfg, par, phase="prefill")
-    ops, _ = split_pattern(expand_tagged_pattern(pattern))
+    entries = _v3_entries(cfg, par)
 
-    routed: list[Gemm] = [
-        o for o in ops
-        if isinstance(o, Gemm) and o.n_replicas == cfg.n_routed_experts
+    routed = [
+        e for e in entries
+        if isinstance(e.operator, Gemm) and e.operator.n_replicas == cfg.n_routed_experts
     ]
-    # Routed experts: EP-sharded only, TP role REPLICATED.
     for r in routed:
-        n_eff, k_eff = r._shape(par)
-        assert n_eff == r.n and k_eff == r.k
-        assert r.n == cfg.m_expert or r.k == cfg.m_expert
+        # No TP sharding on routed (EP only, ep=1 here means no shrink at all).
+        assert r.per_rank_parameter_bytes == r.operator.parameter_bytes()
 
     def _is_shared_expert(op: Gemm) -> bool:
         if op.n_replicas != 1:
             return False
         return (op.n == cfg.m_expert and op.k == cfg.h) or (op.n == cfg.h and op.k == cfg.m_expert)
 
-    shared: list[Gemm] = [
-        o for o in ops if isinstance(o, Gemm) and _is_shared_expert(o)
+    shared = [
+        e for e in entries
+        if isinstance(e.operator, Gemm) and _is_shared_expert(e.operator)
     ]
     n_moe_layers = cfg.n_layers - cfg.n_dense_layers
     assert len(shared) == 3 * n_moe_layers  # gate, up, down per layer
     for s in shared:
-        n_eff, k_eff = s._shape(par)
-        assert (n_eff == s.n // tp and k_eff == s.k) or (n_eff == s.n and k_eff == s.k // tp)
+        assert s.per_rank_parameter_bytes == s.operator.parameter_bytes() // tp
 
 
 def test_strategy_rejects_nondivisible_m_expert():
@@ -209,64 +220,54 @@ def test_strategy_rejects_nondivisible_m_expert():
 def test_v3_lm_head_shrinks_and_emits_all_gather_under_tp():
     cfg = V3Config()
     tp = 4
-    par = ParallelismConfig(tp=tp)
-    pattern = _v3_decorated(cfg, par, phase="prefill")
-    ops, reqs = split_pattern(expand_tagged_pattern(pattern))
-    lm_head = ops[-1]
-    lm_head_reqs = reqs[-1]
-    assert isinstance(lm_head, Gemm)
-    assert lm_head.n == cfg.vocab
-    assert lm_head.k == cfg.h
-    n_eff, _ = lm_head._shape(par)
-    assert n_eff == cfg.vocab // tp
+    entries = _v3_entries(cfg, ParallelismConfig(tp=tp))
+    lm_head_entry = entries[-1]
+    op = lm_head_entry.operator
+    assert isinstance(op, Gemm)
+    assert op.n == cfg.vocab
+    assert op.k == cfg.h
+    assert lm_head_entry.per_rank_parameter_bytes == op.parameter_bytes() // tp
     assert any(
         isinstance(r, NetworkRequirement)
         and r.kind is CollectiveKind.ALL_GATHER
         and r.group is ParallelismGroup.TP
-        for r in lm_head_reqs
-    ), lm_head_reqs
+        for r in lm_head_entry.requirements
+    ), lm_head_entry.requirements
 
 
 def test_v3_lm_head_no_all_gather_when_tp_eq_one():
     cfg = V3Config()
-    pattern = _v3_decorated(cfg, ParallelismConfig(tp=1), phase="prefill")
-    _, reqs = split_pattern(expand_tagged_pattern(pattern))
-    assert reqs[-1] == [], reqs[-1]
+    entries = _v3_entries(cfg, ParallelismConfig(tp=1))
+    assert entries[-1].requirements == []
 
 
 def test_llama_lm_head_shrinks_and_emits_all_gather_under_tp():
     tp = 4
-    par = ParallelismConfig(tp=tp)
-    pattern = _llama_decorated(par, phase="training")
-    ops, reqs = split_pattern(expand_tagged_pattern(pattern))
-    lm_head = ops[-1]
-    lm_head_reqs = reqs[-1]
-    assert isinstance(lm_head, Gemm)
-    assert lm_head.n == SMALL_LLAMA.vocab
-    assert lm_head.k == SMALL_LLAMA.h
-    n_eff, k_eff = lm_head._shape(par)
-    assert n_eff == SMALL_LLAMA.vocab // tp
-    assert k_eff == SMALL_LLAMA.h
+    entries = _llama_entries(ParallelismConfig(tp=tp), phase="training")
+    lm_head_entry = entries[-1]
+    op = lm_head_entry.operator
+    assert isinstance(op, Gemm)
+    assert op.n == SMALL_LLAMA.vocab
+    assert op.k == SMALL_LLAMA.h
+    assert lm_head_entry.per_rank_parameter_bytes == op.parameter_bytes() // tp
     assert any(
         isinstance(r, NetworkRequirement)
         and r.kind is CollectiveKind.ALL_GATHER
         and r.group is ParallelismGroup.TP
-        for r in lm_head_reqs
-    ), lm_head_reqs
+        for r in lm_head_entry.requirements
+    ), lm_head_entry.requirements
 
 
 def test_llama_lm_head_no_all_gather_when_tp_eq_one():
-    pattern = _llama_decorated(ParallelismConfig(tp=1), phase="training")
-    _, reqs = split_pattern(expand_tagged_pattern(pattern))
-    assert reqs[-1] == []
+    entries = _llama_entries(ParallelismConfig(tp=1), phase="training")
+    assert entries[-1].requirements == []
 
 
 def test_lm_head_all_gather_data_GB_matches_T_vocab_dtype():
     """The LM head AllGather sizes off the *full* vocab logits T*vocab*dtype."""
     cfg = V3Config(vocab=32000, h=512, dtype_bytes=2, n_layers=1, n_dense_layers=1)
-    pattern = _v3_decorated(cfg, ParallelismConfig(tp=2), phase="prefill")
-    _, reqs = split_pattern(expand_tagged_pattern(pattern))
-    lm_head_reqs = reqs[-1]
+    entries = _v3_entries(cfg, ParallelismConfig(tp=2))
+    lm_head_reqs = entries[-1].requirements
     ag_req = next(r for r in lm_head_reqs if r.kind is CollectiveKind.ALL_GATHER)
 
     ctx = _ctx(prompt_len=128)
@@ -277,7 +278,7 @@ def test_lm_head_all_gather_data_GB_matches_T_vocab_dtype():
 
 
 def test_v3_strategy_rejects_nondivisible_vocab():
-    cfg = V3Config(vocab=129281)  # prime-ish, not divisible by 4
+    cfg = V3Config(vocab=129281)
     par = ParallelismConfig(tp=4)
     model = V3Model(name="t", role="actor", architecture=cfg)
     with pytest.raises(ValueError, match="vocab"):

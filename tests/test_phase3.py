@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from network_requirement import ParallelismConfig
 from operators.attention import DecodeAttention
 from operators.pattern import expand_tagged_pattern, split_pattern
 from operators.mla import build_mla_decode
@@ -11,9 +10,6 @@ from operators.v3_block import (
 )
 from operators.v3_config import V3Config
 from workload_context import TokenCount, Workload, WorkloadContext
-
-
-PAR = ParallelismConfig()
 
 
 def _prefill_ctx(batch: int, prompt_len: int) -> WorkloadContext:
@@ -103,5 +99,5 @@ def test_v3_prefill_graph_builds():
     ctx = _prefill_ctx(batch=1, prompt_len=4096)
     ops, _ = _expanded_ops(cfg, TokenCount.PREFILL)
     for op in ops:
-        assert op.compute_flops(ctx, PAR) >= 0.0
-        assert op.memory_bytes(ctx, PAR) >= 0.0
+        assert op.compute_flops(ctx) >= 0.0
+        assert op.memory_bytes(ctx) >= 0.0
