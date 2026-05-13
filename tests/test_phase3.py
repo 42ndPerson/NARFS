@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from network_requirement import ParallelismConfig
 from operators.attention import DecodeAttention
-from operators.builders import expand_tagged_pattern, split_pattern
+from operators.pattern import expand_tagged_pattern, split_pattern
 from operators.mla import build_mla_decode
 from operators.v3_block import (
     build_v3_dense_layer,

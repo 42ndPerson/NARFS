@@ -6,27 +6,45 @@ from network_requirement import NetworkRequirement
 from operator_base import Operator
 
 
-# An operator paired with the network requirements it emits at this position.
-# `tuple` matches the signature shape the brief specifies for layer builders.
+@dataclass(frozen=True)
+class LabeledOp:
+    """An operator emitted by an Architecture's `forward_sequence`, tagged
+    with a semantic label that the Strategy uses to decide sharding and
+    collective emission.
+
+    Labels are the vocabulary between Architecture and Strategy. The
+    architecture emits structural operators with canonical labels (e.g.
+    "qkv", "attn_out", "ffn_down", "lm_head"); the strategy looks them up
+    in its label-to-decision table.
+    """
+    label: str
+    operator: Operator
+
+
+# An operator paired with the network requirements emitted at this position.
+# Produced by the Strategy after walking the LabeledOp pattern.
 OperatorWithReqs = tuple[Operator, list[NetworkRequirement]]
 
 
 @dataclass(frozen=True)
 class LayerRepeat:
-    """Repeated block of (operator, requirements) tuples.
-
-    Counterpart to operators.composite.Repeat but for the "with-requirements"
-    pattern carried through ModelMapping.
+    """Repeated layer block. `members` may be either `LabeledOp`s (as
+    emitted by the architecture) or `OperatorWithReqs` tuples (as produced
+    by the strategy after attaching requirements). The expand helpers
+    handle both shapes.
     """
 
     count: int
-    members: list[OperatorWithReqs] = field(default_factory=list)
+    members: list = field(default_factory=list)
 
-    def expand(self) -> list[OperatorWithReqs]:
+    def expand(self) -> list:
         return list(self.members) * self.count
 
 
-PatternEntry = Union[OperatorWithReqs, LayerRepeat]
+# Pattern entries either come direct from the architecture (LabeledOp) or
+# from the strategy post-decoration (OperatorWithReqs); plus LayerRepeat
+# wrappers around either.
+PatternEntry = Union[LabeledOp, OperatorWithReqs, LayerRepeat]
 
 
 @dataclass(frozen=True)
@@ -49,8 +67,10 @@ class LayerTag:
     anchor: Optional[str] = None
 
 
-def expand_tagged_pattern(pattern: list[PatternEntry]) -> list[OperatorWithReqs]:
-    out: list[OperatorWithReqs] = []
+def expand_tagged_pattern(pattern: list[PatternEntry]) -> list:
+    """Expand a pattern, flattening LayerRepeats. Returns the same entry
+    types as the input (LabeledOp or OperatorWithReqs)."""
+    out = []
     for item in pattern:
         if isinstance(item, LayerRepeat):
             out.extend(item.expand())
@@ -62,7 +82,8 @@ def expand_tagged_pattern(pattern: list[PatternEntry]) -> list[OperatorWithReqs]
 def expand_pattern_with_layers(
     pattern: list[PatternEntry],
 ) -> list[tuple[OperatorWithReqs, LayerTag]]:
-    """Expand a pattern, attaching a `LayerTag` to each operator.
+    """Expand a pattern of `OperatorWithReqs` (and LayerRepeats of them),
+    attaching a `LayerTag` to each operator.
 
     Layer indexing scheme: LayerRepeats consume a sequential range of layer
     indices starting from 0. With `[Repeat(3, dense), Repeat(58, moe)]`,
@@ -72,12 +93,11 @@ def expand_pattern_with_layers(
     Anchor classification: top-level (non-LayerRepeat) entries before any
     LayerRepeat get `anchor="first"`; entries after the last LayerRepeat
     get `anchor="last"`; entries between LayerRepeats (rare) default to
-    "first" but the layer-aware partitioner treats those defensively.
+    "first".
     """
-    # Locate the index of the first and last LayerRepeat to classify anchors.
     repeat_positions = [i for i, item in enumerate(pattern) if isinstance(item, LayerRepeat)]
-    first_repeat = repeat_positions[0] if repeat_positions else None
-    last_repeat = repeat_positions[-1] if repeat_positions else None
+    first_repeat = repeat_positions[0] if repeat_positions else -1
+    last_repeat = repeat_positions[-1] if repeat_positions else -1
 
     out: list[tuple[OperatorWithReqs, LayerTag]] = []
     next_layer_idx = 0
@@ -86,17 +106,23 @@ def expand_pattern_with_layers(
             for layer_iter in range(item.count):
                 idx = next_layer_idx + layer_iter
                 tag = LayerTag(layer_index=idx, anchor=None)
-                for op_with_reqs in item.members:
-                    out.append((op_with_reqs, tag))
+                for member in item.members:
+                    assert not isinstance(member, LabeledOp), (
+                        "expand_pattern_with_layers expects strategy-decorated "
+                        "OperatorWithReqs entries, not raw LabeledOps"
+                    )
+                    out.append((member, tag))
             next_layer_idx += item.count
         else:
-            if first_repeat is None or pos < first_repeat:
+            assert not isinstance(item, LabeledOp), (
+                "expand_pattern_with_layers expects strategy-decorated "
+                "OperatorWithReqs entries, not raw LabeledOps"
+            )
+            if first_repeat < 0 or pos < first_repeat:
                 anchor = "first"
             elif pos > last_repeat:
                 anchor = "last"
             else:
-                # Between repeats — defensive default. None of our shipped
-                # builders produce this case.
                 anchor = "first"
             out.append((item, LayerTag(layer_index=None, anchor=anchor)))
     return out

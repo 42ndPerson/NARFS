@@ -20,10 +20,10 @@ from network_requirement import (
     ParallelismGroup,
 )
 from operators.attention import DecodeAttention, PrefillAttention
-from operators.builders import expand_tagged_pattern, split_pattern
+from operators.pattern import expand_tagged_pattern, split_pattern
 from operators.elementwise import RoPE
 from operators.gemm import Gemm
-from operators.llama_builder import build_llama_pattern
+from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.mla import build_mla_decode, build_mla_prefill
 from operators.v3_block import (
@@ -238,7 +238,7 @@ def test_llama_lm_head_shrinks_and_emits_all_gather_under_tp():
     arch = SMALL_LLAMA
     tp = 4
     par = ParallelismConfig(tp=tp)
-    pattern = build_llama_pattern(arch, "training", par)
+    pattern = LlamaModel(name="t", role="actor", architecture=arch).forward_sequence("training", par)
     ops, reqs = split_pattern(expand_tagged_pattern(pattern))
     lm_head = ops[-1]
     lm_head_reqs = reqs[-1]
@@ -258,7 +258,9 @@ def test_llama_lm_head_shrinks_and_emits_all_gather_under_tp():
 
 
 def test_llama_lm_head_no_all_gather_when_tp_eq_one():
-    pattern = build_llama_pattern(SMALL_LLAMA, "training", ParallelismConfig(tp=1))
+    pattern = LlamaModel(name="t", role="actor", architecture=SMALL_LLAMA).forward_sequence(
+        "training", ParallelismConfig(tp=1)
+    )
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     assert reqs[-1] == []
 
@@ -290,4 +292,6 @@ def test_llama_lm_head_rejects_nondivisible_vocab():
         rope_dim=64, vocab=32001, dtype_bytes=2,
     )
     with pytest.raises(ValueError, match="vocab"):
-        build_llama_pattern(arch, "training", ParallelismConfig(tp=4))
+        LlamaModel(name="t", role="actor", architecture=arch).forward_sequence(
+            "training", ParallelismConfig(tp=4)
+        )

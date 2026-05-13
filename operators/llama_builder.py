@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from model import ArchitectureConfig, Model
+from model import Model
 from network_requirement import (
     CollectiveKind,
     NetworkRequirement,
@@ -10,7 +10,7 @@ from network_requirement import (
 )
 from operator_base import Operator
 from operators.attention import DecodeAttention, PrefillAttention
-from operators.builders import (
+from operators.pattern import (
     OperatorWithReqs,
     PatternEntry,
     LayerRepeat,
@@ -179,53 +179,48 @@ def build_llama_layer(
 
 @dataclass(frozen=True)
 class LlamaModel(Model):
-    """Llama-style decoder model. Architecture must be a `LlamaConfig`."""
+    """Llama-style decoder model. Architecture must be a `LlamaConfig`.
+
+    Full graph: embed, n_layers transformer blocks, final norm, LM head.
+    LM head is TP-sharded along vocab; AllGather collects logits across TP
+    ranks when tp > 1.
+    """
 
     def forward_sequence(
         self, phase: str, parallelism: ParallelismConfig
     ) -> list[PatternEntry]:
-        return build_llama_pattern(self.architecture, phase, parallelism)
+        arch = self.architecture
+        if not isinstance(arch, LlamaConfig):
+            raise TypeError(
+                f"LlamaModel requires LlamaConfig, got {type(arch).__name__}"
+            )
 
+        # Early divisibility checks for clearer build-time errors. Operators
+        # would re-raise these at compute time, but catching them here
+        # surfaces the failure at mapping construction.
+        tp = parallelism.tp
+        if tp > 1:
+            if arch.vocab % tp != 0:
+                raise ValueError(f"vocab ({arch.vocab}) must be divisible by tp ({tp})")
+            if arch.n_q % tp != 0:
+                raise ValueError(f"n_q ({arch.n_q}) must be divisible by tp ({tp})")
+            if arch.n_kv % tp != 0:
+                raise ValueError(f"n_kv ({arch.n_kv}) must be divisible by tp ({tp})")
+            if arch.m % tp != 0:
+                raise ValueError(f"m ({arch.m}) must be divisible by tp ({tp})")
 
-def build_llama_pattern(
-    arch: ArchitectureConfig,
-    phase: str,
-    parallelism: ParallelismConfig,
-) -> list[PatternEntry]:
-    """Full Llama model graph: embed, n_layers transformer blocks, final norm, LM head.
-
-    LM head is TP-sharded along vocab; AllGather collects logits across TP
-    ranks when tp > 1.
-    """
-    if not isinstance(arch, LlamaConfig):
-        raise TypeError(f"build_llama_pattern requires LlamaConfig, got {type(arch).__name__}")
-
-    # Early divisibility checks for clearer build-time errors. Operators
-    # would re-raise these at compute time, but catching them here surfaces
-    # the failure at mapping construction.
-    tp = parallelism.tp
-    if tp > 1:
-        if arch.vocab % tp != 0:
-            raise ValueError(f"vocab ({arch.vocab}) must be divisible by tp ({tp})")
-        if arch.n_q % tp != 0:
-            raise ValueError(f"n_q ({arch.n_q}) must be divisible by tp ({tp})")
-        if arch.n_kv % tp != 0:
-            raise ValueError(f"n_kv ({arch.n_kv}) must be divisible by tp ({tp})")
-        if arch.m % tp != 0:
-            raise ValueError(f"m ({arch.m}) must be divisible by tp ({tp})")
-
-    layer = build_llama_layer(arch, phase, parallelism)
-    tc = _phase_to_token_count(phase)
-    lm_head_reqs: list[NetworkRequirement] = (
-        [_lm_head_all_gather(arch, tc)] if parallelism.tp > 1 else []
-    )
-    return [
-        # Embedding is replicated across TP in Llama (full vocab table on every rank).
-        (TokenEmbedding(vocab=arch.vocab, h=arch.h, token_count=tc,
-                        dtype_bytes=arch.dtype_bytes), []),
-        LayerRepeat(arch.n_layers, layer),
-        (RMSNorm(arch.h, tc, arch.dtype_bytes), []),
-        # LM head: vocab-parallel — splits N along the vocab dim, gathers logits.
-        (Gemm(n=arch.vocab, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes,
-              parallelism_role=_VOCAB), lm_head_reqs),
-    ]
+        layer = build_llama_layer(arch, phase, parallelism)
+        tc = _phase_to_token_count(phase)
+        lm_head_reqs: list[NetworkRequirement] = (
+            [_lm_head_all_gather(arch, tc)] if parallelism.tp > 1 else []
+        )
+        return [
+            # Embedding is replicated across TP in Llama (full vocab table on every rank).
+            (TokenEmbedding(vocab=arch.vocab, h=arch.h, token_count=tc,
+                            dtype_bytes=arch.dtype_bytes), []),
+            LayerRepeat(arch.n_layers, layer),
+            (RMSNorm(arch.h, tc, arch.dtype_bytes), []),
+            # LM head: vocab-parallel — splits N along the vocab dim, gathers logits.
+            (Gemm(n=arch.vocab, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes,
+                  parallelism_role=_VOCAB), lm_head_reqs),
+        ]

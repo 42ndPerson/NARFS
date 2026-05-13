@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from network_requirement import ParallelismConfig
-    from operators.builders import PatternEntry
+    from operators.pattern import PatternEntry
 
 
 @dataclass(frozen=True)

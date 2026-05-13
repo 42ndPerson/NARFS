@@ -16,7 +16,6 @@ from __future__ import annotations
 import pytest
 
 from hardware import HardwareSpec
-from mesh import Mesh
 from model_mapping import ModelMapping
 from network_op import (
     AllReduceRing,
@@ -33,7 +32,7 @@ from network_requirement import (
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import Relation
-from shard import Shard
+from strategies import MegatronStrategy
 from submesh_mapping import resolve_op_transfers
 from topo import Device, HostTopo, Link, Path
 from workload_context import (
@@ -95,25 +94,11 @@ def _make_mapping(parallelism: ParallelismConfig) -> ModelMapping:
         role="actor",
         architecture=SMALL_LLAMA,
     )
-    shards: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    host = 0
-    for d in range(parallelism.dp):
-        for p in range(parallelism.pp):
-            for t in range(parallelism.tp):
-                s = Shard(model=model, dp=d, pp=p, tp=t)
-                dev = _dev(host)
-                shards[s] = dev
-                d2s[dev] = s
-                host += 1
-    mesh = Mesh(devices=[_dev(i) for i in range(host)])
-    return ModelMapping(
+    num_devs = parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp
+    return MegatronStrategy(parallelism).build_mm(
         model=model,
-        mesh=mesh,
         workload=Workload.PREPARATION,
-        parallelism=parallelism,
-        shards_to_devices=shards,
-        device_to_shard=d2s,
+        devices=[_dev(i) for i in range(num_devs)],
     )
 
 

@@ -25,13 +25,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from mesh import Mesh
 from model_mapping import ModelMapping, SimulationResult
 from network_requirement import ParallelismConfig
 from operator_base import Operator
-from shard import Shard
 from simulator import simulate_rlhf_iteration
 from stages import RLHFTimeline
+from strategies import MegatronStrategy
 from submesh_mapping import SubmeshMapping
 from topo import Device, HostTopo, Link, Path as TopoPath
 from validation.scenarios import SCENARIOS, Scenario
@@ -180,24 +179,11 @@ def build_model_mapping(scenario: Scenario) -> tuple[ModelMapping, HostTopo]:
         role="actor",
         architecture=scenario.architecture,
     )
-    num_hosts, coords = shard_grid(scenario.parallelism)
-    shards: list[Shard] = []
-    s2d: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    for host_id, (d, p, t, e) in enumerate(coords):
-        s = Shard(model=model, dp=d, pp=p, tp=t, ep=e)
-        shards.append(s)
-        dev = _dev(host_id)
-        s2d[s] = dev
-        d2s[dev] = s
-    mesh = Mesh(devices=[_dev(i) for i in range(num_hosts)])
-    mm = ModelMapping(
+    num_hosts, _ = shard_grid(scenario.parallelism)
+    mm = MegatronStrategy(scenario.parallelism).build_mm(
         model=model,
-        mesh=mesh,
         workload=scenario.workload,
-        parallelism=scenario.parallelism,
-        shards_to_devices=s2d,
-        device_to_shard=d2s,
+        devices=[_dev(i) for i in range(num_hosts)],
     )
     topo = _topology_for_scenario(scenario, num_hosts)
     return mm, topo

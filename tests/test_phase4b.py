@@ -20,9 +20,9 @@ from resharding import (
     NaiveP2PStrategy,
     llama_total_parameter_bytes,
 )
-from shard import Shard
 from simulator import simulate_rlhf_iteration, simulate_stage
 from stages import RLHFTimeline, StageBoundary
+from strategies import MegatronStrategy
 from submesh_mapping import SubmeshMapping
 from topo import Device, HostTopo, Link, Path
 from transition import StageTransition
@@ -92,27 +92,10 @@ def _make_mapping(
     if len(host_ids) != expected:
         raise ValueError(f"need {expected} hosts for {parallelism}, got {len(host_ids)}")
 
-    shards: list[Shard] = []
-    s2d: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    idx = 0
-    for d in range(parallelism.dp):
-        for p in range(parallelism.pp):
-            for t in range(parallelism.tp):
-                s = Shard(model=model, dp=d, pp=p, tp=t)
-                dev = _dev(host_ids[idx])
-                idx += 1
-                shards.append(s)
-                s2d[s] = dev
-                d2s[dev] = s
-    mesh = _mesh_for(host_ids)
-    return ModelMapping(
+    return MegatronStrategy(parallelism).build_mm(
         model=model,
-        mesh=mesh,
         workload=workload,
-        parallelism=parallelism,
-        shards_to_devices=s2d,
-        device_to_shard=d2s,
+        devices=[_dev(h) for h in host_ids],
     )
 
 

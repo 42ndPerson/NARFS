@@ -23,7 +23,7 @@ from network_requirement import (
 )
 from operator_base import Operator
 from operators.backward import derive_backward_pattern
-from operators.builders import (
+from operators.pattern import (
     LayerTag,
     OperatorWithReqs,
     expand_pattern_with_layers,

@@ -24,10 +24,10 @@ from network_requirement import (
     ParallelismConfig,
     ParallelismGroup,
 )
-from operators.builders import expand_tagged_pattern, split_pattern
-from operators.llama_builder import build_llama_pattern
+from operators.pattern import expand_tagged_pattern, split_pattern
+from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
-from operators.v3_block import build_v3_model
+from operators.v3_block import V3Model
 from operators.v3_config import V3Config
 
 
@@ -35,6 +35,19 @@ SMALL_LLAMA = LlamaConfig(
     h=512, n_layers=4, n_q=8, n_kv=4, head_size=64,
     m=2048, rope_dim=64, vocab=32000, dtype_bytes=2,
 )
+
+
+def _llama_pattern(phase: str, par: ParallelismConfig):
+    """Construct a LlamaModel and return its forward_sequence pattern."""
+    return LlamaModel(
+        name="t", role="actor", architecture=SMALL_LLAMA,
+    ).forward_sequence(phase, par)
+
+
+def _v3_pattern(cfg: V3Config, phase: str, par: ParallelismConfig):
+    return V3Model(
+        name="t", role="actor", architecture=cfg,
+    ).forward_sequence(phase, par)
 
 
 def _dp_ar_reqs(reqs_list: list[list[NetworkRequirement]]) -> list[NetworkRequirement]:
@@ -47,26 +60,26 @@ def _dp_ar_reqs(reqs_list: list[list[NetworkRequirement]]) -> list[NetworkRequir
 
 
 def test_llama_training_emits_dp_ar_with_dp_gt_1():
-    pattern = build_llama_pattern(SMALL_LLAMA, "training", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _llama_pattern("training", ParallelismConfig(tp=1, pp=1, dp=2))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     dp_ars = _dp_ar_reqs(reqs)
     assert len(dp_ars) > 0, "training+dp=2 should emit DP-AR per layer instance"
 
 
 def test_llama_training_no_dp_ar_when_dp_eq_one():
-    pattern = build_llama_pattern(SMALL_LLAMA, "training", ParallelismConfig(tp=1, pp=1, dp=1))
+    pattern = _llama_pattern("training", ParallelismConfig(tp=1, pp=1, dp=1))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     assert _dp_ar_reqs(reqs) == []
 
 
 def test_llama_prefill_no_dp_ar_even_with_dp_gt_1():
-    pattern = build_llama_pattern(SMALL_LLAMA, "prefill", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _llama_pattern("prefill", ParallelismConfig(tp=1, pp=1, dp=2))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     assert _dp_ar_reqs(reqs) == [], "prefill must not emit DP-AR; backward doesn't run"
 
 
 def test_llama_decode_no_dp_ar_even_with_dp_gt_1():
-    pattern = build_llama_pattern(SMALL_LLAMA, "decode", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _llama_pattern("decode", ParallelismConfig(tp=1, pp=1, dp=2))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     assert _dp_ar_reqs(reqs) == []
 
@@ -74,7 +87,7 @@ def test_llama_decode_no_dp_ar_even_with_dp_gt_1():
 def test_llama_dp_ar_attached_to_last_op_of_each_layer():
     """Layer template's DP-AR should hang on ffn_down (the last in-layer op),
     so it appears once per layer instance in the expanded list."""
-    pattern = build_llama_pattern(SMALL_LLAMA, "training", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _llama_pattern("training", ParallelismConfig(tp=1, pp=1, dp=2))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     # n_layers = 4 — DP-AR appears 4 times in the flat req list (one per
     # repetition of the template).
@@ -87,7 +100,7 @@ def test_llama_dp_ar_dedupes_to_single_requirement():
     objects → the dedup hash collapses them to one NetworkOp instance.
     We pin the equality here so changes to dedup keys don't silently break
     the model_mapping cache."""
-    pattern = build_llama_pattern(SMALL_LLAMA, "training", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _llama_pattern("training", ParallelismConfig(tp=1, pp=1, dp=2))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     dp_ars = _dp_ar_reqs(reqs)
     assert len(set(dp_ars)) == 1
@@ -95,7 +108,7 @@ def test_llama_dp_ar_dedupes_to_single_requirement():
 
 def test_llama_dp_ar_size_matches_layer_parameter_bytes():
     """data_GB_fn returns total layer param bytes in GB, ignoring ctx."""
-    pattern = build_llama_pattern(SMALL_LLAMA, "training", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _llama_pattern("training", ParallelismConfig(tp=1, pp=1, dp=2))
     ops, reqs = split_pattern(expand_tagged_pattern(pattern))
     dp_ar = _dp_ar_reqs(reqs)[0]
 
@@ -130,7 +143,7 @@ def _v3_small() -> V3Config:
 
 def test_v3_training_emits_dp_ar_per_layer_template():
     cfg = _v3_small()
-    pattern = build_v3_model(cfg, "training", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _v3_pattern(cfg,"training", ParallelismConfig(tp=1, pp=1, dp=2))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     dp_ars = _dp_ar_reqs(reqs)
     # n_dense_layers = 2, n_moe_layers = 2 → 4 attachments total.
@@ -139,7 +152,7 @@ def test_v3_training_emits_dp_ar_per_layer_template():
 
 def test_v3_dense_and_moe_dp_ar_have_distinct_payload_ids():
     cfg = _v3_small()
-    pattern = build_v3_model(cfg, "training", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _v3_pattern(cfg,"training", ParallelismConfig(tp=1, pp=1, dp=2))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     dp_ars = _dp_ar_reqs(reqs)
     payload_ids = {r.payload_id for r in dp_ars}
@@ -156,7 +169,7 @@ def test_v3_moe_and_dense_dp_ar_have_distinct_sizes():
     we assert the structural inequality rather than a magnitude bound.
     """
     cfg = _v3_small()
-    pattern = build_v3_model(cfg, "training", ParallelismConfig(tp=1, pp=1, dp=2))
+    pattern = _v3_pattern(cfg,"training", ParallelismConfig(tp=1, pp=1, dp=2))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     dp_ars = _dp_ar_reqs(reqs)
     by_payload: dict = {}
@@ -171,6 +184,6 @@ def test_v3_moe_and_dense_dp_ar_have_distinct_sizes():
 
 def test_v3_training_no_dp_ar_when_dp_eq_one():
     cfg = _v3_small()
-    pattern = build_v3_model(cfg, "training", ParallelismConfig(tp=1, pp=1, dp=1))
+    pattern = _v3_pattern(cfg,"training", ParallelismConfig(tp=1, pp=1, dp=1))
     _, reqs = split_pattern(expand_tagged_pattern(pattern))
     assert _dp_ar_reqs(reqs) == []

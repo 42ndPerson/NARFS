@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from hardware import HardwareSpec
 from network_requirement import ParallelismConfig
 from operator_base import Operator
-from operators.builders import (
+from operators.pattern import (
+    LabeledOp,
     OperatorWithReqs,
     PatternEntry,
     LayerRepeat,
@@ -80,12 +81,20 @@ def derive_backward_pattern(
     out: list[PatternEntry] = []
     for item in forward_pattern:
         if isinstance(item, LayerRepeat):
-            members: list[OperatorWithReqs] = [
-                (BackwardOp(forward=op, recompute=recompute), reqs)
-                for (op, reqs) in item.members
-            ]
+            members: list[OperatorWithReqs] = []
+            for member in item.members:
+                assert not isinstance(member, LabeledOp), (
+                    "derive_backward_pattern expects OperatorWithReqs entries, "
+                    "not raw LabeledOps — strategy must decorate before derivation"
+                )
+                op, reqs = member
+                members.append((BackwardOp(forward=op, recompute=recompute), reqs))
             out.append(LayerRepeat(item.count, members))
         else:
+            assert not isinstance(item, LabeledOp), (
+                "derive_backward_pattern expects OperatorWithReqs entries, "
+                "not raw LabeledOps — strategy must decorate before derivation"
+            )
             op, reqs = item
             out.append((BackwardOp(forward=op, recompute=recompute), reqs))
     return out

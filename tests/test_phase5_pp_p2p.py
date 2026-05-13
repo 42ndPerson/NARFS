@@ -27,8 +27,8 @@ from network_requirement import (
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import NetworkPhase
-from shard import Shard
 from simulator import simulate_stage
+from strategies import MegatronStrategy
 from submesh_mapping import SubmeshMapping
 from topo import Device, HostTopo, Link, Path
 from workload_context import Workload, WorkloadContext
@@ -76,22 +76,10 @@ def _make_model() -> LlamaModel:
 def _make_mapping(
     parallelism: ParallelismConfig, workload: Workload, host_ids: list[int],
 ) -> ModelMapping:
-    model = _make_model()
-    shards: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    idx = 0
-    for d in range(parallelism.dp):
-        for p in range(parallelism.pp):
-            for t in range(parallelism.tp):
-                s = Shard(model=model, dp=d, pp=p, tp=t)
-                dev = _dev(host_ids[idx])
-                shards[s] = dev
-                d2s[dev] = s
-                idx += 1
-    mesh = Mesh(devices=[_dev(h) for h in host_ids])
-    return ModelMapping(
-        model=model, mesh=mesh, workload=workload, parallelism=parallelism,
-        shards_to_devices=shards, device_to_shard=d2s,
+    return MegatronStrategy(parallelism).build_mm(
+        model=_make_model(),
+        workload=workload,
+        devices=[_dev(h) for h in host_ids],
     )
 
 

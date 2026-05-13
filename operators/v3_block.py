@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from model import ArchitectureConfig, Model
+from model import Model
 from network_requirement import (
     CollectiveKind,
     NetworkRequirement,
@@ -10,7 +10,7 @@ from network_requirement import (
     ParallelismGroup,
 )
 from operator_base import Operator
-from operators.builders import (
+from operators.pattern import (
     OperatorWithReqs,
     PatternEntry,
     LayerRepeat,
@@ -265,20 +265,6 @@ def build_v3_model(
     ]
 
 
-def build_v3_pattern(
-    arch: ArchitectureConfig,
-    phase: str,
-    parallelism: ParallelismConfig,
-) -> list[PatternEntry]:
-    """Standalone pattern builder for V3 models. Used as the underlying
-    implementation for `V3Model.forward_sequence`, and directly by tests
-    that need to inspect V3 patterns without going through ModelMapping.
-    """
-    if not isinstance(arch, V3Config):
-        raise TypeError(f"build_v3_pattern requires V3Config, got {type(arch).__name__}")
-    return build_v3_model(arch, phase, parallelism)
-
-
 @dataclass(frozen=True)
 class V3Model(Model):
     """DeepSeek-V3-style decoder with MLA + dense + MoE layers. Architecture
@@ -288,4 +274,9 @@ class V3Model(Model):
     def forward_sequence(
         self, phase: str, parallelism: ParallelismConfig
     ) -> list[PatternEntry]:
-        return build_v3_pattern(self.architecture, phase, parallelism)
+        arch = self.architecture
+        if not isinstance(arch, V3Config):
+            raise TypeError(
+                f"V3Model requires V3Config, got {type(arch).__name__}"
+            )
+        return build_v3_model(arch, phase, parallelism)

@@ -14,8 +14,6 @@ from __future__ import annotations
 import pytest
 
 from hardware import HardwareSpec
-from mesh import Mesh
-from model_mapping import ModelMapping
 from network_op import AllToAll, AllReduceRing
 from network_requirement import (
     CollectiveKind,
@@ -27,6 +25,7 @@ from operators.llama_config import LlamaConfig
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
 from shard import Shard
+from strategies import MegatronStrategy
 from topo import Device
 from workload_context import Workload
 
@@ -78,22 +77,10 @@ def test_tp_and_ep_axes_coexist_on_same_mesh():
     shards along the EP axis (with TP fixed)."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    shards: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    host = 0
-    for ep in range(4):
-        for tp in range(2):
-            s = Shard(model=model, dp=0, pp=0, tp=tp, ep=ep)
-            dev = _dev(host)
-            shards[s] = dev
-            d2s[dev] = s
-            host += 1
-    mesh = Mesh(devices=[_dev(i) for i in range(host)])
-    mm = ModelMapping(
-        model=model, mesh=mesh,
+    mm = MegatronStrategy(parallelism).build_mm(
+        model=model,
         workload=Workload.PREPARATION,
-        parallelism=parallelism,
-        shards_to_devices=shards, device_to_shard=d2s,
+        devices=[_dev(i) for i in range(parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp)],
     )
 
     tp_group = mm._shards_in_group(ParallelismGroup.TP)
@@ -115,22 +102,10 @@ def test_ep_alltoall_walks_ep_ranks_not_tp_ranks():
     TP axis it used to alias). 4-rank AllToAll has 4*3 = 12 transfers."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    shards: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    host = 0
-    for ep in range(4):
-        for tp in range(2):
-            s = Shard(model=model, dp=0, pp=0, tp=tp, ep=ep)
-            dev = _dev(host)
-            shards[s] = dev
-            d2s[dev] = s
-            host += 1
-    mesh = Mesh(devices=[_dev(i) for i in range(host)])
-    mm = ModelMapping(
-        model=model, mesh=mesh,
+    mm = MegatronStrategy(parallelism).build_mm(
+        model=model,
         workload=Workload.PREPARATION,
-        parallelism=parallelism,
-        shards_to_devices=shards, device_to_shard=d2s,
+        devices=[_dev(i) for i in range(parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp)],
     )
 
     a2a_op = next(
@@ -147,22 +122,10 @@ def test_tp_ar_with_ep_active_walks_only_tp_ranks():
     span exactly TP ranks even when EP > 1 — i.e., 2 ranks not 8."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    shards: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    host = 0
-    for ep in range(4):
-        for tp in range(2):
-            s = Shard(model=model, dp=0, pp=0, tp=tp, ep=ep)
-            dev = _dev(host)
-            shards[s] = dev
-            d2s[dev] = s
-            host += 1
-    mesh = Mesh(devices=[_dev(i) for i in range(host)])
-    mm = ModelMapping(
-        model=model, mesh=mesh,
+    mm = MegatronStrategy(parallelism).build_mm(
+        model=model,
         workload=Workload.PREPARATION,
-        parallelism=parallelism,
-        shards_to_devices=shards, device_to_shard=d2s,
+        devices=[_dev(i) for i in range(parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp)],
     )
 
     ar_op = next(
@@ -178,51 +141,33 @@ def test_axis_validator_rejects_underprovisioned_ep_layout():
     """parallelism.ep=4 but only 2 EP ranks in the shard layout → ValueError."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=1, pp=1, dp=1, ep=4)
-    # Bad layout: only 2 EP ranks, parallelism promises 4.
-    shards: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    for ep in range(2):  # under-provisioned
-        s = Shard(model=model, dp=0, pp=0, tp=0, ep=ep)
-        dev = _dev(ep)
-        shards[s] = dev
-        d2s[dev] = s
-    mesh = Mesh(devices=[_dev(0), _dev(1)])
+    # Bad layout: only 2 devices, parallelism promises EP=4.
     with pytest.raises(ValueError, match="EP"):
-        ModelMapping(
-            model=model, mesh=mesh,
+        MegatronStrategy(parallelism).build_mm(
+            model=model,
             workload=Workload.PREPARATION,
-            parallelism=parallelism,
-            shards_to_devices=shards, device_to_shard=d2s,
+            devices=[_dev(0), _dev(1)],
         )
 
 
 def test_axis_validator_rejects_underprovisioned_tp_layout():
     model = _llama_model()
     parallelism = ParallelismConfig(tp=4, pp=1, dp=1, ep=1)
-    # Only 2 TP shards, parallelism wants 4.
-    shards = {Shard(model=model, dp=0, pp=0, tp=t): _dev(t) for t in range(2)}
-    d2s = {dev: s for s, dev in shards.items()}
-    mesh = Mesh(devices=[_dev(0), _dev(1)])
+    # Only 2 devices, parallelism wants TP=4.
     with pytest.raises(ValueError, match="TP"):
-        ModelMapping(
-            model=model, mesh=mesh,
+        MegatronStrategy(parallelism).build_mm(
+            model=model,
             workload=Workload.PREPARATION,
-            parallelism=parallelism,
-            shards_to_devices=shards, device_to_shard=d2s,
+            devices=[_dev(0), _dev(1)],
         )
 
 
 def test_axis_validator_silent_when_degree_is_one():
     """`parallelism.ep == 1` means no EP collective; no validation needed."""
     model = _llama_model()
-    # Construct a single-shard layout with ep=0 (default) and parallelism ep=1.
-    s = Shard(model=model, dp=0, pp=0, tp=0)
-    dev = _dev(0)
-    mesh = Mesh(devices=[dev])
     # Should construct without raising (parallelism degrees all 1).
-    ModelMapping(
-        model=model, mesh=mesh,
+    MegatronStrategy(ParallelismConfig(tp=1, pp=1, dp=1, ep=1)).build_mm(
+        model=model,
         workload=Workload.PREPARATION,
-        parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=1),
-        shards_to_devices={s: dev}, device_to_shard={dev: s},
+        devices=[_dev(0)],
     )

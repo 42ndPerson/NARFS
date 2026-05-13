@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from hardware import HardwareSpec
-from mesh import Mesh
 from model_mapping import ModelMapping
 from network_op import AllReduceRing
 from network_requirement import (
@@ -15,7 +14,7 @@ from operators.backward import BackwardOp
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.optimizer import AdamOptimizerOp
-from shard import Shard
+from strategies import MegatronStrategy
 from topo import Device
 from workload_context import Workload, WorkloadContext
 
@@ -59,27 +58,11 @@ def _make_mapping(workload: Workload, parallelism: ParallelismConfig) -> ModelMa
     Shards laid out by (dp, pp, tp) → host_id deterministically.
     """
     model = _make_model()
-    shards: list[Shard] = []
-    shards_to_dev: dict[Shard, Device] = {}
-    dev_to_shard: dict[Device, Shard] = {}
-    host_id = 0
-    for d in range(parallelism.dp):
-        for p in range(parallelism.pp):
-            for t in range(parallelism.tp):
-                s = Shard(model=model, dp=d, pp=p, tp=t)
-                shards.append(s)
-                dev = _dev(host_id)
-                shards_to_dev[s] = dev
-                dev_to_shard[dev] = s
-                host_id += 1
-    mesh = Mesh(devices=[_dev(i) for i in range(host_id)])
-    return ModelMapping(
+    num_devs = parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp
+    return MegatronStrategy(parallelism).build_mm(
         model=model,
-        mesh=mesh,
         workload=workload,
-        parallelism=parallelism,
-        shards_to_devices=shards_to_dev,
-        device_to_shard=dev_to_shard,
+        devices=[_dev(i) for i in range(num_devs)],
     )
 
 
@@ -215,27 +198,11 @@ def test_pp_partition_v3_balances_cost():
         architecture=arch,
     )
     parallelism = ParallelismConfig(tp=1, pp=4, dp=1, ep=1)
-    shards: list[Shard] = []
-    s2d: dict[Shard, Device] = {}
-    d2s: dict[Device, Shard] = {}
-    host = 0
-    for d in range(parallelism.dp):
-        for p in range(parallelism.pp):
-            for t in range(parallelism.tp):
-                s = Shard(model=model, dp=d, pp=p, tp=t)
-                shards.append(s)
-                dev = _dev(host)
-                s2d[s] = dev
-                d2s[dev] = s
-                host += 1
-    mesh = Mesh(devices=[_dev(i) for i in range(host)])
-    mm = ModelMapping(
+    num_devs = parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp
+    mm = MegatronStrategy(parallelism).build_mm(
         model=model,
-        mesh=mesh,
         workload=Workload.PREPARATION,
-        parallelism=parallelism,
-        shards_to_devices=s2d,
-        device_to_shard=d2s,
+        devices=[_dev(i) for i in range(num_devs)],
     )
 
     # Compute per-stage cost at the reference workload the partitioner used.
