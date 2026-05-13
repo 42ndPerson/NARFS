@@ -1,22 +1,34 @@
-"""Parallelism strategies — the layer that owns *how* a model is sharded
-onto hardware. The core simulator (CombinedOp, ModelMapping, simulator.py,
-RLHFTimeline) is intentionally unaware of parallelism semantics; a strategy
-is what bridges the parallelism-free architecture (`Model.forward_sequence`)
-to the resolved simulation plan (`ModelMapping`).
+"""Parallelism schemes + placements — the two-layer split that owns
+*how* a model is sharded onto hardware.
 
-A strategy carries a `ParallelismConfig` and exposes `build_mm(...)` to
-produce a `ModelMapping` from an ordered device pool. Internally the
-strategy walks the architecture's labeled forward sequence, applies
-scheme-specific sharding role decorations to each operator, and emits
-collectives (TP-AR, EP-AllToAll, DP-grad-AR, LM-head AllGather) based on
-labels. The result is an `OperatorWithReqs`-decorated pattern that
-ModelMapping consumes.
+The split:
+
+- **ParallelismScheme** owns parallelism-only decisions: which operators
+  get sharded along which axis, what collectives fire where, how compute
+  divides per rank, parallelism-vs-architecture divisibility. Schemes
+  produce a `Plan` containing the decorated forward/decode patterns plus
+  the abstract `Shard`s the scheme requires. A `Plan` is device-agnostic.
+
+- **Placement** is a function `(plan, devices, topology) -> dict[Shard, Device]`
+  that binds shards to physical hardware. Placement is independent of the
+  scheme: different placements can be tried against the same plan to
+  optimize cross-stage resharding cost (as in HybridFlow's 3D HybridEngine).
+
+- **`assemble(plan, placement, devices, topology)`** combines the two,
+  producing a `ModelMapping` ready for simulation. NetworkOps' physical
+  `endpoint_pairs` resolve at this step.
+
+The core simulator (CombinedOp, ModelMapping, simulator.py, RLHFTimeline)
+is intentionally unaware of parallelism or placement semantics.
+
+The legacy names `ParallelismStrategy` and `MegatronStrategy` are aliases
+for backwards compatibility.
 """
 from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from mesh import Mesh
 from model import Model
@@ -39,11 +51,11 @@ from operators.v3_config import V3Config
 from parallelism_role import EPMode, ParallelismRole, TPMode
 from relation import Relation
 from shard import Shard
-from topo import Device
+from topo import Device, HostTopo
 from workload_context import TokenCount, Workload
 
 
-# Canonical role aliases used by Megatron-family strategies.
+# Canonical role aliases used by Megatron-family schemes.
 _REP = ParallelismRole()
 _COL = ParallelismRole(tp=TPMode.COLUMN_PARALLEL)
 _ROW = ParallelismRole(tp=TPMode.ROW_PARALLEL)
@@ -146,62 +158,126 @@ def _phase_to_token_count(phase: str) -> TokenCount:
     raise ValueError(f"Unknown phase: {phase!r}")
 
 
-# ---- base class -------------------------------------------------------------
-
-
-class ParallelismStrategy(ABC):
-    """Owns parallelism / sharding / collective-emission logic for one scheme."""
-
-    parallelism: ParallelismConfig
-
-    @abstractmethod
-    def build_mm(
-        self,
-        model: Model,
-        workload: Workload,
-        devices: list[Device],
-        name: str = "",
-        role: str = "",
-    ) -> ModelMapping:
-        ...
-
-
-# ---- MegatronStrategy -------------------------------------------------------
+# ---- Plan -------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class MegatronStrategy(ParallelismStrategy):
-    """Canonical Megatron-style sharding.
+class Plan:
+    """A device-agnostic execution plan produced by a `ParallelismScheme`.
 
-    Sharding scheme (applied via label → role mapping):
-      - QKV, gate, up, LM head:   column-parallel
-      - O, down, shared-expert-down: row-parallel (TP-AR after)
-      - Attention, RoPE:          heads-parallel
-      - Routed MoE experts:       EP-sharded
-      - Embedding, RMSNorm:       replicated
-      - DP gradient AR per layer template in TRAINING when dp > 1
-      - LM-head AllGather under TP > 1
-      - PP activation P2P per microbatch when pp > 1 (installed by ModelMapping)
+    Holds the strategy-decorated patterns (operators have sharding roles
+    applied and NetworkRequirements attached based on labels), the abstract
+    `Shard`s the scheme uses, plus the originating model / parallelism /
+    workload. A `Placement` binds the shards to physical devices; the
+    `assemble(...)` step produces the final ModelMapping.
+    """
+    model: Model
+    workload: Workload
+    parallelism: ParallelismConfig
+    forward_pattern: list = field(default_factory=list)
+    decode_pattern: list = field(default_factory=list)
+    shards: tuple[Shard, ...] = field(default_factory=tuple)
+
+
+# ---- Placement --------------------------------------------------------------
+
+
+# A placement is a callable that, given a plan, a device pool, and (optionally)
+# the topology, returns the binding `dict[Shard, Device]`. Concrete placements
+# implement particular allocation strategies (canonical Megatron, rail-aligned,
+# HybridFlow-3D-engine, etc.). A precomputed `dict[Shard, Device]` is also
+# acceptable when the caller wants to express the mapping directly.
+Placement = Callable[
+    [Plan, list[Device], Optional[HostTopo]],
+    dict[Shard, Device],
+]
+
+
+def canonical_megatron_placement(
+    plan: Plan,
+    devices: list[Device],
+    topology: Optional[HostTopo] = None,
+) -> dict[Shard, Device]:
+    """The default Megatron placement: walks plan.shards in their canonical
+    (dp, pp, ep, tp) order (TP innermost) and pairs with `devices` in input
+    order. Consecutive devices become TP-adjacent ranks — matching the
+    typical intra-host NVLink/NVSwitch layout where TP collectives benefit
+    most from device proximity. Caller is responsible for ordering `devices`
+    to match topology (devices on the same host first, then next host).
+
+    `topology` is accepted for interface symmetry but ignored.
+    """
+    del topology
+    if len(devices) != len(plan.shards):
+        par = plan.parallelism
+        raise ValueError(
+            f"canonical_megatron_placement: requires {len(plan.shards)} devices "
+            f"for DP={par.dp} PP={par.pp} EP={par.ep} TP={par.tp}, "
+            f"got {len(devices)}"
+        )
+    return dict(zip(plan.shards, devices))
+
+
+# ---- base scheme ------------------------------------------------------------
+
+
+class ParallelismScheme(ABC):
+    """A scheme owns parallelism-only decisions: which operators shard along
+    which axis, what collectives fire where, how compute divides per rank.
+
+    `build_plan(...)` produces a device-agnostic `Plan`. Use `assemble(...)`
+    (or the `build_mm(...)` facade method) to bind devices and produce a
+    `ModelMapping`.
     """
 
     parallelism: ParallelismConfig
 
+    @abstractmethod
+    def build_plan(self, model: Model, workload: Workload) -> Plan:
+        ...
+
     def build_mm(
         self,
         model: Model,
         workload: Workload,
         devices: list[Device],
+        placement: Placement = canonical_megatron_placement,
+        topology: Optional[HostTopo] = None,
         name: str = "",
         role: str = "",
     ) -> ModelMapping:
+        """Convenience facade: build a Plan and assemble it with the given
+        placement. Defaults to `canonical_megatron_placement` for backwards
+        compatibility with pre-split callers.
+        """
         del name, role
-        self._validate_devices(devices)
+        plan = self.build_plan(model, workload)
+        return assemble(plan, placement, devices, topology)
+
+
+# ---- MegatronScheme ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MegatronScheme(ParallelismScheme):
+    """Canonical Megatron-style sharding.
+
+    Scheme rules (applied via label → decoration table):
+      - QKV, gate, up, LM head:    column-parallel
+      - O, down, shared-expert-down: row-parallel (TP-AR after)
+      - Attention, RoPE:           heads-parallel
+      - Routed MoE experts:        EP-sharded
+      - Embedding, RMSNorm:        replicated
+      - DP gradient AR per layer template in TRAINING when dp > 1
+      - LM-head AllGather under TP > 1
+      - PP activation P2P per microbatch when pp > 1 (installed at assemble)
+    """
+
+    parallelism: ParallelismConfig
+
+    def build_plan(self, model: Model, workload: Workload) -> Plan:
         self._validate_against_arch(model.architecture)
-
-        s2d = self._assign_shards(model, devices)
-        d2s = {dev: s for s, dev in s2d.items()}
-
-        # Build per-phase decorated patterns and pass them in to ModelMapping.
+        shards = self._enumerate_shards(model)
         forward_pattern: list[PatternEntry] = []
         decode_pattern: list[PatternEntry] = []
         if workload is Workload.GENERATION:
@@ -220,48 +296,30 @@ class MegatronStrategy(ParallelismStrategy):
                 model.forward_sequence("training"), model.architecture, "training",
             )
         # DORMANT: empty patterns.
-
-        return ModelMapping(
+        return Plan(
             model=model,
-            mesh=Mesh(devices=list(devices)),
             workload=workload,
             parallelism=self.parallelism,
-            shards_to_devices=s2d,
-            device_to_shard=d2s,
             forward_pattern=forward_pattern,
             decode_pattern=decode_pattern,
+            shards=tuple(shards),
         )
 
-    # ---- shard placement ---------------------------------------------------
+    # ---- shard enumeration -------------------------------------------------
 
-    def _validate_devices(self, devices: list[Device]) -> None:
-        expected = (
-            self.parallelism.dp
-            * self.parallelism.pp
-            * self.parallelism.ep
-            * self.parallelism.tp
-        )
-        if len(devices) != expected:
-            raise ValueError(
-                f"MegatronStrategy.build_mm: requires {expected} devices for "
-                f"DP={self.parallelism.dp} PP={self.parallelism.pp} "
-                f"EP={self.parallelism.ep} TP={self.parallelism.tp}, "
-                f"got {len(devices)}"
-            )
-
-    def _assign_shards(
-        self, model: Model, devices: list[Device]
-    ) -> dict[Shard, Device]:
-        s2d: dict[Shard, Device] = {}
-        idx = 0
-        # TP innermost so consecutive devices become TP-adjacent ranks.
+    def _enumerate_shards(self, model: Model) -> list[Shard]:
+        """Produces the scheme's canonical-order shard list. TP varies
+        innermost (so consecutive shards are TP-adjacent), then EP, PP, DP.
+        Placement functions decide how these abstract coordinates bind to
+        physical devices.
+        """
+        shards: list[Shard] = []
         for d in range(self.parallelism.dp):
             for p in range(self.parallelism.pp):
                 for e in range(self.parallelism.ep):
                     for t in range(self.parallelism.tp):
-                        s2d[Shard(model=model, dp=d, pp=p, tp=t, ep=e)] = devices[idx]
-                        idx += 1
-        return s2d
+                        shards.append(Shard(model=model, dp=d, pp=p, tp=t, ep=e))
+        return shards
 
     # ---- architecture validation -------------------------------------------
 
@@ -293,21 +351,19 @@ class MegatronStrategy(ParallelismStrategy):
                     f"n_routed_experts ({arch.n_routed_experts}) must be divisible by ep ({ep})"
                 )
 
-    # ---- pattern decoration ------------------------------------------------
+    # ---- inspection hook ---------------------------------------------------
 
     def decorated_pattern(
         self, model: Model, phase: str
     ) -> list[PatternEntry]:
-        """Public hook for inspecting the strategy's decorated pattern
-        without constructing a full ModelMapping. Validates the architecture
-        against the strategy's parallelism, then walks
-        `model.forward_sequence(phase)` and applies sharding roles +
-        collectives.
-        """
+        """Public hook for inspecting the scheme's decorated pattern for one
+        phase without constructing a full Plan or ModelMapping. Used by tests."""
         self._validate_against_arch(model.architecture)
         return self._decorate_pattern(
             model.forward_sequence(phase), model.architecture, phase,
         )
+
+    # ---- pattern decoration ------------------------------------------------
 
     def _decorate_pattern(
         self,
@@ -315,15 +371,7 @@ class MegatronStrategy(ParallelismStrategy):
         arch,
         phase: str,
     ) -> list[PatternEntry]:
-        """Walk a labeled pattern; produce an OperatorWithReqs-decorated form.
-
-        - Each LabeledOp's operator has its `parallelism_role` set per the
-          Megatron table.
-        - Collectives (TP-AR, EP-AllToAll, LM-head AG) are attached as
-          NetworkRequirements alongside the operators.
-        - For TRAINING when dp > 1, a per-LayerRepeat-template DP gradient AR
-          is appended to the last op of each repeated layer.
-        """
+        """Walk a labeled pattern; produce an OperatorWithReqs-decorated form."""
         out: list[PatternEntry] = []
         tc = _phase_to_token_count(phase)
         for item in labeled:
@@ -353,10 +401,8 @@ class MegatronStrategy(ParallelismStrategy):
             dec = _MEGATRON_LABELS[labeled.label]
         except KeyError:
             raise ValueError(
-                f"MegatronStrategy: no decoration rule for label {labeled.label!r}"
+                f"MegatronScheme: no decoration rule for label {labeled.label!r}"
             )
-        # Apply the role to the operator. Operators are frozen dataclasses;
-        # use dataclasses.replace.
         op = dataclasses.replace(labeled.operator, parallelism_role=dec.role)
         reqs: list[NetworkRequirement] = []
         if dec.collective is not None:
@@ -413,12 +459,6 @@ class MegatronStrategy(ParallelismStrategy):
     def _dp_grad_all_reduce(
         self, layer_ops: list[Operator], template_labels: tuple,
     ) -> NetworkRequirement:
-        """DP gradient AllReduce sized to the per-rank parameter byte count
-        of one layer template. `template_labels` is the tuple of label
-        strings for the ops in this LayerRepeat, used as the dedup
-        discriminator so different layer templates (e.g. V3 dense vs MoE)
-        don't collapse to one requirement.
-        """
         total_GB = sum(
             op.parameter_bytes_per_rank(self.parallelism) for op in layer_ops
         ) / 1e9
@@ -430,3 +470,50 @@ class MegatronStrategy(ParallelismStrategy):
             payload_id=("dp_grad", template_labels),
             data_GB_fn=lambda _ctx, _v=total_GB: _v,
         )
+
+
+# ---- assemble ---------------------------------------------------------------
+
+
+def assemble(
+    plan: Plan,
+    placement: Placement,
+    devices: list[Device],
+    topology: Optional[HostTopo] = None,
+) -> ModelMapping:
+    """Combine a scheme-produced `Plan` with a `Placement` to produce a
+    fully-resolved `ModelMapping`. Device-binding happens here.
+
+    Validates device count and resolves each shard's device via the
+    placement callable; constructs the ModelMapping with the decorated
+    patterns from the plan, leaving NetworkOp resolution to ModelMapping's
+    own __post_init__.
+    """
+    s2d = placement(plan, devices, topology)
+    if set(s2d.keys()) != set(plan.shards):
+        missing = set(plan.shards) - set(s2d.keys())
+        extra = set(s2d.keys()) - set(plan.shards)
+        raise ValueError(
+            f"placement returned mapping that doesn't cover plan.shards: "
+            f"missing {len(missing)} shard(s), extra {len(extra)} key(s)"
+        )
+    d2s = {dev: s for s, dev in s2d.items()}
+    return ModelMapping(
+        model=plan.model,
+        mesh=Mesh(devices=list(devices)),
+        workload=plan.workload,
+        parallelism=plan.parallelism,
+        shards_to_devices=s2d,
+        device_to_shard=d2s,
+        forward_pattern=plan.forward_pattern,
+        decode_pattern=plan.decode_pattern,
+    )
+
+
+# ---- backward-compat aliases ------------------------------------------------
+
+# Callers that imported the previous `ParallelismStrategy` / `MegatronStrategy`
+# names continue to work. New code should prefer `ParallelismScheme` /
+# `MegatronScheme`.
+ParallelismStrategy = ParallelismScheme
+MegatronStrategy = MegatronScheme
