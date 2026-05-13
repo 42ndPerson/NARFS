@@ -29,7 +29,7 @@ from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
-from strategies import MegatronStrategy
+from strategies import MegatronScheme
 
 
 SMALL_LLAMA = LlamaConfig(
@@ -39,15 +39,15 @@ SMALL_LLAMA = LlamaConfig(
 
 
 def _llama_pattern(phase: str, par: ParallelismConfig):
-    """Return the MegatronStrategy-decorated pattern (with requirements)
+    """Return the MegatronScheme-decorated pattern (with requirements)
     for a SMALL_LLAMA at the given parallelism."""
     model = LlamaModel(name="t", role="actor", architecture=SMALL_LLAMA)
-    return MegatronStrategy(par).decorated_pattern(model, phase)
+    return MegatronScheme(par).decorated_pattern(model, phase)
 
 
 def _v3_pattern(cfg: V3Config, phase: str, par: ParallelismConfig):
     model = V3Model(name="t", role="actor", architecture=cfg)
-    return MegatronStrategy(par).decorated_pattern(model, phase)
+    return MegatronScheme(par).decorated_pattern(model, phase)
 
 
 def _dp_ar_reqs(reqs_list: list[list[NetworkRequirement]]) -> list[NetworkRequirement]:

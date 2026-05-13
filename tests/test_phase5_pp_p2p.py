@@ -28,7 +28,7 @@ from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import NetworkPhase
 from simulator import simulate_stage
-from strategies import MegatronStrategy
+from strategies import MegatronScheme
 from topo import Device, HostTopo, Link, Path
 from workload_context import Workload, WorkloadContext
 
@@ -75,7 +75,7 @@ def _make_model() -> LlamaModel:
 def _make_mapping(
     parallelism: ParallelismConfig, workload: Workload, host_ids: list[int],
 ) -> ModelMapping:
-    return MegatronStrategy(parallelism).build_mm(
+    return MegatronScheme(parallelism).build_mm(
         model=_make_model(),
         workload=workload,
         devices=[_dev(h) for h in host_ids],

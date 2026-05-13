@@ -14,7 +14,7 @@ from operators.backward import BackwardOp
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.optimizer import AdamOptimizerOp
-from strategies import MegatronStrategy
+from strategies import MegatronScheme
 from topo import Device
 from workload_context import Workload, WorkloadContext
 
@@ -59,7 +59,7 @@ def _make_mapping(workload: Workload, parallelism: ParallelismConfig) -> ModelMa
     """
     model = _make_model()
     num_devs = parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp
-    return MegatronStrategy(parallelism).build_mm(
+    return MegatronScheme(parallelism).build_mm(
         model=model,
         workload=workload,
         devices=[_dev(i) for i in range(num_devs)],
@@ -199,7 +199,7 @@ def test_pp_partition_v3_balances_cost():
     )
     parallelism = ParallelismConfig(tp=1, pp=4, dp=1, ep=1)
     num_devs = parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp
-    mm = MegatronStrategy(parallelism).build_mm(
+    mm = MegatronScheme(parallelism).build_mm(
         model=model,
         workload=Workload.PREPARATION,
         devices=[_dev(i) for i in range(num_devs)],

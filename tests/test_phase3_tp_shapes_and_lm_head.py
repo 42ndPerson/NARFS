@@ -31,7 +31,7 @@ from operators.llama_config import LlamaConfig
 from operators.pattern import LabeledOp, expand_tagged_pattern
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
-from strategies import MegatronStrategy
+from strategies import MegatronScheme
 from topo import Device
 from workload_context import (
     Workload,
@@ -66,13 +66,13 @@ def _ctx(prompt_len: int = 128) -> WorkloadContext:
 
 def _llama_entries(par: ParallelismConfig, phase: str = "prefill"):
     model = LlamaModel(name="t", role="actor", architecture=SMALL_LLAMA)
-    pattern = MegatronStrategy(par).decorated_pattern(model, phase)
+    pattern = MegatronScheme(par).decorated_pattern(model, phase)
     return [e for e in expand_tagged_pattern(pattern) if not isinstance(e, LabeledOp)]
 
 
 def _v3_entries(cfg: V3Config, par: ParallelismConfig, phase: str = "prefill"):
     model = V3Model(name="t", role="actor", architecture=cfg)
-    pattern = MegatronStrategy(par).decorated_pattern(model, phase)
+    pattern = MegatronScheme(par).decorated_pattern(model, phase)
     return [e for e in expand_tagged_pattern(pattern) if not isinstance(e, LabeledOp)]
 
 
@@ -132,7 +132,7 @@ def test_strategy_rejects_nondivisible_n_h():
     par = ParallelismConfig(tp=5)
     model = V3Model(name="t", role="actor", architecture=cfg)
     with pytest.raises(ValueError, match="n_h"):
-        MegatronStrategy(par).build_mm(
+        MegatronScheme(par).build_mm(
             model=model,
             workload=Workload.PREPARATION,
             devices=[_dev(i) for i in range(5)],
@@ -159,7 +159,7 @@ def test_strategy_rejects_nondivisible_m_dense():
     par = ParallelismConfig(tp=2)
     model = V3Model(name="t", role="actor", architecture=cfg)
     with pytest.raises(ValueError, match="m_dense"):
-        MegatronStrategy(par).build_mm(
+        MegatronScheme(par).build_mm(
             model=model,
             workload=Workload.PREPARATION,
             devices=[_dev(i) for i in range(2)],
@@ -207,7 +207,7 @@ def test_strategy_rejects_nondivisible_m_expert():
     par = ParallelismConfig(tp=2)
     model = V3Model(name="t", role="actor", architecture=cfg)
     with pytest.raises(ValueError, match="m_expert"):
-        MegatronStrategy(par).build_mm(
+        MegatronScheme(par).build_mm(
             model=model,
             workload=Workload.PREPARATION,
             devices=[_dev(i) for i in range(2)],
@@ -282,7 +282,7 @@ def test_v3_strategy_rejects_nondivisible_vocab():
     par = ParallelismConfig(tp=4)
     model = V3Model(name="t", role="actor", architecture=cfg)
     with pytest.raises(ValueError, match="vocab"):
-        MegatronStrategy(par).build_mm(
+        MegatronScheme(par).build_mm(
             model=model,
             workload=Workload.PREPARATION,
             devices=[_dev(i) for i in range(4)],
@@ -297,7 +297,7 @@ def test_llama_strategy_rejects_nondivisible_vocab():
     par = ParallelismConfig(tp=4)
     model = LlamaModel(name="t", role="actor", architecture=arch)
     with pytest.raises(ValueError, match="vocab"):
-        MegatronStrategy(par).build_mm(
+        MegatronScheme(par).build_mm(
             model=model,
             workload=Workload.PREPARATION,
             devices=[_dev(i) for i in range(4)],

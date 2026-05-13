@@ -1,12 +1,11 @@
 """V3 architecture builder. Produces labeled operator patterns; the
-ParallelismStrategy decorates with sharding roles and collectives.
+`ParallelismScheme` decorates with sharding roles and collectives.
 """
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
 from model import Model
-from network_requirement import ParallelismConfig
 from operators.elementwise import RMSNorm, SwiGLUActivation
 from operators.embed import TokenEmbedding
 from operators.gemm import Gemm
@@ -135,12 +134,7 @@ class V3Model(Model):
     Architecture must be a `V3Config`.
     """
 
-    def forward_sequence(
-        self, phase: str, parallelism: ParallelismConfig | None = None
-    ) -> list[PatternEntry]:
-        # `parallelism` accepted for legacy callers but unused — strategy
-        # owns parallelism decisions. Phase 2b will drop it from the ABC.
-        del parallelism
+    def forward_sequence(self, phase: str) -> list[PatternEntry]:
         arch = self.architecture
         if not isinstance(arch, V3Config):
             raise TypeError(

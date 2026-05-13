@@ -32,7 +32,7 @@ from network_requirement import (
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import Relation
-from strategies import MegatronStrategy
+from strategies import MegatronScheme
 from model_mapping_group import resolve_op_transfers
 from topo import Device, HostTopo, Link, Path
 from workload_context import (
@@ -95,7 +95,7 @@ def _make_mapping(parallelism: ParallelismConfig) -> ModelMapping:
         architecture=SMALL_LLAMA,
     )
     num_devs = parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp
-    return MegatronStrategy(parallelism).build_mm(
+    return MegatronScheme(parallelism).build_mm(
         model=model,
         workload=Workload.PREPARATION,
         devices=[_dev(i) for i in range(num_devs)],

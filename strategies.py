@@ -20,9 +20,6 @@ The split:
 
 The core simulator (CombinedOp, ModelMapping, simulator.py, RLHFTimeline)
 is intentionally unaware of parallelism or placement semantics.
-
-The legacy names `ParallelismStrategy` and `MegatronStrategy` are aliases
-for backwards compatibility.
 """
 from __future__ import annotations
 from abc import ABC, abstractmethod
@@ -150,9 +147,9 @@ def _make_compute_time_fn(
     Approximation: per-rank time = full-model `kernel_time` divided by the
     TP factor when the role shards along TP. EP doesn't divide per-call
     compute since the operator is sized to a single bottleneck expert. The
-    full-shape kernel still drives GEMV / small-dim tier selection — that's
-    the ±30% asymmetry we accept in Phase 2c (per-rank tile shape under
-    COL vs ROW parallel isn't modeled).
+    full-shape kernel still drives GEMV / small-dim tier selection — an
+    acknowledged ±30% asymmetry (per-rank tile shape under COL vs ROW
+    parallel isn't modeled).
     """
     tp_factor = par.tp if par.tp > 1 and _tp_divides_compute(role.tp) else 1
     if tp_factor == 1:
@@ -814,12 +811,3 @@ class MegatronToMegatronP2P(ReshardingStrategy):
         return movements
 
 
-# ---- backward-compat aliases ------------------------------------------------
-
-# Callers that imported the previous `ParallelismStrategy` / `MegatronStrategy`
-# names continue to work. New code should prefer `ParallelismScheme` /
-# `MegatronScheme`.
-ParallelismStrategy = ParallelismScheme
-MegatronStrategy = MegatronScheme
-# Resharding alias (old `NaiveP2PStrategy` name).
-NaiveP2PStrategy = MegatronToMegatronP2P

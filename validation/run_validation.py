@@ -30,7 +30,7 @@ from network_requirement import ParallelismConfig
 from operator_base import Operator
 from simulator import simulate_rlhf_iteration
 from stages import RLHFTimeline
-from strategies import MegatronStrategy
+from strategies import MegatronScheme
 from model_mapping_group import ModelMappingGroup
 from topo import Device, HostTopo, Link, Path as TopoPath
 from validation.scenarios import SCENARIOS, Scenario
@@ -159,8 +159,8 @@ def shard_grid(
 ) -> tuple[int, list[tuple[int, int, int, int]]]:
     """Return (num_hosts, [(dp, pp, tp, ep), ...]).
 
-    Phase 2 made EP an independent axis from TP, so this enumerates the
-    full 4D coordinate set. One host per (dp, pp, tp, ep) cell.
+    EP is an independent axis from TP, so this enumerates the full 4D
+    coordinate set. One host per (dp, pp, tp, ep) cell.
     """
     coords = [
         (d, p, t, e)
@@ -180,7 +180,7 @@ def build_model_mapping(scenario: Scenario) -> tuple[ModelMapping, HostTopo]:
         architecture=scenario.architecture,
     )
     num_hosts, _ = shard_grid(scenario.parallelism)
-    mm = MegatronStrategy(scenario.parallelism).build_mm(
+    mm = MegatronScheme(scenario.parallelism).build_mm(
         model=model,
         workload=scenario.workload,
         devices=[_dev(i) for i in range(num_hosts)],
@@ -220,6 +220,8 @@ class ScenarioResult:
     passes_tolerance: bool
     needs_findings: bool
     op_breakdown: list[tuple[str, float]] = field(default_factory=list)
+    topology_kind: str = "shared_spine"
+    parallelism_hint: str = ""
     notes: str = ""
 
 
@@ -278,6 +280,7 @@ def run_scenario(scenario: Scenario) -> ScenarioResult:
     passes = abs(error_pct) <= scenario.tolerance_percent
     needs_findings = abs(error_pct) > 30.0
 
+    par = scenario.parallelism
     return ScenarioResult(
         name=scenario.name,
         description=scenario.description,
@@ -288,6 +291,8 @@ def run_scenario(scenario: Scenario) -> ScenarioResult:
         passes_tolerance=passes,
         needs_findings=needs_findings,
         op_breakdown=op_type_breakdown(mm, mm_result),
+        topology_kind=scenario.topology_kind,
+        parallelism_hint=f"tp={par.tp},pp={par.pp},dp={par.dp},ep={par.ep}",
     )
 
 
@@ -309,19 +314,30 @@ def print_table(results: list[ScenarioResult]) -> None:
         )
 
 
+def _fraction_of(r: ScenarioResult, op_names: set[str]) -> float:
+    """Sum of wall-time fraction across the named operator types."""
+    return sum(frac for name, frac in r.op_breakdown if name in op_names)
+
+
 def _findings_hypothesis(r: ScenarioResult) -> str:
     """Best-effort hypothesis for why a scenario is more than 30% off.
 
-    These are heuristics — the user reviews findings.md and decides.
+    Dispatches on the actual op-breakdown of the predicted run, not on
+    scenario-name heuristics — so a DeepSeek-V3 scenario where AllToAll
+    dominates gets a different message from one where PrefillAttention does.
     """
     err = r.error_pct
-    name = r.name
+    top_op = r.op_breakdown[0][0] if r.op_breakdown else ""
+    is_multi_gpu = r.parallelism_hint and r.parallelism_hint != "tp=1,pp=1,dp=1,ep=1"
+
+    if -30 <= err <= 30:
+        return "Within 30% — no findings entry needed."
+
     if err < -30:
-        # Predicted too low.
-        if "decode" in name:
+        if top_op == "DecodeAttention" or "decode" in r.name:
             return (
                 "Pure roofline + GEMV efficiency tier (0.3 compute / 0.65 memory for M<16 "
-                "GEMMs) is now the prediction. Total memory traffic per decode step ≈ model "
+                "GEMMs) is the prediction. Total memory traffic per decode step ≈ model "
                 "weights once + KV cache reads. The remaining gap to measured wall time is "
                 "kernel-launch overhead, sampling, and KV-cache management — the simulator's "
                 "scope stops at the roofline. To close further: (a) profile actual GEMV "
@@ -329,54 +345,77 @@ def _findings_hypothesis(r: ScenarioResult) -> str:
                 "rather than the 0.65 default; (b) bake in a per-decode-step constant overhead "
                 "after profiling a real run. Do NOT auto-tune from validation alone."
             )
-        if "prefill" in name:
-            return (
-                "Pure compute prediction is below measured wall time. Likely contributions: "
-                "(a) compute_efficiency=0.7 may be high for small-batch prefill where "
-                "tensor-core occupancy is limited (effective ~0.5-0.6 at batch=1); "
-                "(b) measured times include framework overhead (allocator, dispatch, sampling) "
-                "the simulator does not model; (c) reference may include one-off setup costs."
-            )
-        return "Predicted below reference; investigate compute_efficiency and overhead."
-    if err > 30:
-        # Predicted too high.
-        if "training" in name:
-            return (
-                "Above reference. Layer-aware PP partitioning is now in place "
-                "(the previous flat-partition bug is fixed); remaining gap likely comes from: "
-                "(a) BackwardOp's 3× compute / 3× memory scaling with full activation "
-                "recomputation is conservative — FlashAttention backward + selective "
-                "checkpointing typically achieve 2.0-2.5× rather than 3×; "
-                "(b) compute_efficiency=0.7 may be high for backward kernels where "
-                "memory-traffic patterns differ from forward; (c) the optimizer step time "
-                "(per-layer AdamOptimizerOps) gets multiplied through the (num_microbatches + "
-                "pp - 1) pipeline formula even though optimizer is one-shot per iteration — "
-                "minor effect since optimizer time is small relative to backward, but a "
-                "principled fix would isolate optimizer from the 1F1B multiplier."
-            )
-        if "deepseek_v3" in name:
-            return (
-                "Above reference. PrefillAttention dominates ~80% of predicted wall time. "
-                "memory_bytes = 3·n_h·head_size·t²/B·dtype gives ~14 ms per attention layer "
-                "for V3 (n_h=128, head_size=192, t=4096, B=64), or ~880 ms across 61 layers "
-                "alone. Two refinements would close the gap: (a) memory_efficiency=0.8 is "
-                "conservative for H100 HBM3 — measured 0.85-0.9 — bumping it to 0.9 trims "
-                "~10%; (b) FlashAttention-3 has lower effective memory traffic than the "
-                "3·l²/B·d_h tile model assumes (recomputes Q/K/V tiles instead of materializing). "
-                "Re-deriving the FA3 memory factor on H100 would shave the rest."
-            )
-        if "tp" in (r.parallelism_hint or ""):
-            return (
-                "Above reference. If data_GB_estimates is non-empty, steady-op contention is "
-                "computed against ALL steady transfers as if concurrent — for a single submesh "
-                "with serialized layers this over-counts. With empty estimates (the validation "
-                "default), this branch shouldn't fire; investigate operator-level cost."
+        return (
+            "Predicted below reference. Likely contributions: (a) compute_efficiency=0.7 may "
+            "be high for the workload (effective ~0.5-0.6 at small batch); (b) measured times "
+            "include framework overhead (allocator, dispatch, sampling) the simulator does "
+            "not model; (c) reference may include one-off setup costs."
+        )
+
+    # err > 30 — predicted too high.
+
+    # Order matters: check the most-specific dominant-op signals first.
+
+    if top_op == "BackwardOp" or _fraction_of(r, {"BackwardOp"}) > 0.4:
+        return (
+            "Above reference; BackwardOp dominates the breakdown. Likely contributions: "
+            "(a) BackwardOp's 3× compute / 3× memory scaling with full activation "
+            "recomputation is conservative — FlashAttention backward + selective "
+            "checkpointing typically achieve 2.0-2.5× rather than 3×; (b) "
+            "compute_efficiency=0.7 may be high for backward kernels where memory-traffic "
+            "patterns differ from forward; (c) per-layer AdamOptimizerOps get multiplied "
+            "through the (num_microbatches + pp - 1) pipeline formula even though optimizer "
+            "is one-shot per iteration — minor effect, but a principled fix would isolate "
+            "the optimizer from the 1F1B multiplier."
+        )
+
+    moe_collective_frac = _fraction_of(r, {"DispatchMarker", "CombineMarker"})
+    if moe_collective_frac >= 0.4:
+        topo_note = ""
+        if r.topology_kind == "shared_spine":
+            topo_note = (
+                " The shared-spine topology routes every inter-EP transfer through one "
+                "logical link, so AllToAll bandwidth is divided across all concurrent EP "
+                "transfers — a pessimistic baseline relative to real NVSwitch/IB fabrics. "
+                "The matching NVSwitch / multinode scenarios will cut this contention "
+                "substantially."
             )
         return (
-            "Above reference. Either compute_efficiency too low for this workload, or the "
-            "operator pattern includes work the reference doesn't model."
+            f"Above reference; MoE dispatch+combine AllToAll collectives account for "
+            f"{moe_collective_frac*100:.0f}% of predicted wall time. The cost comes from "
+            f"AllToAll network time attached to the (zero-compute) DispatchMarker / "
+            f"CombineMarker ops, not from operator arithmetic.{topo_note} To close the "
+            f"gap further: (a) measure per-token AllToAll wall time on the target topology "
+            f"to fit a per-EP contention factor; (b) the single-spine contention model is "
+            f"approximate even with shared bandwidth — fairness-aware contention would "
+            f"better match a switch fabric's per-pair bandwidth allocation."
         )
-    return "Within 30% — no findings entry needed."
+
+    if top_op == "PrefillAttention" or _fraction_of(r, {"PrefillAttention"}) >= 0.4:
+        return (
+            "Above reference; PrefillAttention dominates the breakdown. "
+            "memory_bytes = 3·n_heads·head_size·t²/B·dtype assumes the FA-2-style tile "
+            "model; FlashAttention-3 on H100 has lower effective memory traffic "
+            "(recomputes Q/K/V tiles instead of materializing). Two refinements would close "
+            "the gap: (a) memory_efficiency=0.8 is conservative for H100 HBM3 — measured "
+            "0.85-0.9 — bumping it to 0.9 trims ~10%; (b) re-derive the FA3 memory factor "
+            "on H100 for the dominant residual."
+        )
+
+    if r.topology_kind == "shared_spine" and is_multi_gpu:
+        return (
+            "Above reference. The shared-spine topology fixture routes every inter-GPU "
+            "transfer through one logical link, so every concurrent collective contends "
+            "for the same bandwidth. Real NVLink/NVSwitch fabrics have per-pair private "
+            "lanes; the matching `_nvswitch` / `_multinode` scenarios will be substantially "
+            "lower. Tune by running on a less pessimistic topology or by measuring "
+            "NVLink utilization during a single AllReduce on the target hardware."
+        )
+
+    return (
+        "Above reference. Either compute_efficiency too low for this workload, or the "
+        "operator pattern includes work the reference doesn't model."
+    )
 
 
 def write_findings_md(results: list[ScenarioResult], out_path: Path) -> None:
@@ -486,11 +525,6 @@ def main() -> int:
         except Exception as e:
             print(f"ERROR running {scenario.name}: {type(e).__name__}: {e}", file=sys.stderr)
             raise
-        # Stash some hint for the hypothesis text.
-        r.parallelism_hint = (
-            f"tp={scenario.parallelism.tp},pp={scenario.parallelism.pp},"
-            f"dp={scenario.parallelism.dp},ep={scenario.parallelism.ep}"
-        )
         results.append(r)
 
     print_table(results)

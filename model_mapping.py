@@ -148,7 +148,7 @@ class ModelMapping:
     sequence and sums per-position wall times.
 
     For GENERATION, the prefill and decode patterns are built independently
-    via `model.forward_sequence(phase, parallelism)`; each phase's sequence
+    via `model.forward_sequence(phase)`; each phase's sequence
     has its own pipeline partition. For TRAINING, the forward sequence is
     augmented with derived backward and per-LayerTag Adam optimizer ops.
     """

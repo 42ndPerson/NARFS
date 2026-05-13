@@ -29,8 +29,8 @@ class ConcreteOp(Operator):
         self, ctx: WorkloadContext, hw: HardwareSpec
     ) -> float:
         del ctx
-        # Test op uses small_gemm_efficiency when small_dim=True so the legacy
-        # Phase 1 small-dim test path keeps exercising the override mechanism.
+        # Test op uses small_gemm_efficiency when small_dim=True so the
+        # small-dim test path keeps exercising the override mechanism.
         return hw.small_gemm_efficiency if self.small_dim else hw.compute_efficiency
 
 

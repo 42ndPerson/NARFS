@@ -1,10 +1,9 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from network_requirement import ParallelismConfig
     from operators.pattern import PatternEntry
 
 
@@ -26,10 +25,8 @@ class Model(ABC):
 
     `forward_sequence` is parallelism-agnostic. It emits the architectural
     structure as a list of `LabeledOp`s wrapped in `LayerRepeat`s where
-    appropriate. The `parallelism` parameter is preserved for backwards
-    compatibility with pre-strategy callers but is no longer used by the
-    canonical subclasses — sharding decisions are owned by the
-    `ParallelismStrategy` that consumes the labeled pattern.
+    appropriate. Sharding decisions are owned by the `ParallelismScheme`
+    that consumes the labeled pattern.
     """
 
     name: str
@@ -37,11 +34,7 @@ class Model(ABC):
     architecture: ArchitectureConfig
 
     @abstractmethod
-    def forward_sequence(
-        self,
-        phase: str,
-        parallelism: "Optional[ParallelismConfig]" = None,
-    ) -> "list[PatternEntry]":
+    def forward_sequence(self, phase: str) -> "list[PatternEntry]":
         """Labeled operator pattern for a single forward pass under `phase`.
 
         `phase` is one of {"prefill", "decode", "training"}. The returned

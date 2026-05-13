@@ -1,7 +1,6 @@
 """WorkloadContext invariant + per-invocation operator sizing.
 
-These tests pin down the contract loosened during Phase 5 validation and
-then re-tightened in this phase: `batch_size = microbatch_size × num_microbatches`,
+Pin the contract: `batch_size = microbatch_size × num_microbatches`,
 and operators size off `microbatch_size` (per-invocation) rather than
 `batch_size` (global iteration).
 """

@@ -19,7 +19,7 @@ from relation import NetworkPhase
 from simulator import simulate_rlhf_iteration, simulate_stage
 from stages import RLHFTimeline, StageBoundary
 from strategies import (
-    MegatronStrategy,
+    MegatronScheme,
     MegatronToMegatronP2P,
     llama_total_parameter_bytes,
 )
@@ -87,7 +87,7 @@ def _make_mapping(
     if len(host_ids) != expected:
         raise ValueError(f"need {expected} hosts for {parallelism}, got {len(host_ids)}")
 
-    return MegatronStrategy(parallelism).build_mm(
+    return MegatronScheme(parallelism).build_mm(
         model=model,
         workload=workload,
         devices=[_dev(h) for h in host_ids],
@@ -182,10 +182,10 @@ def test_rlhf_iteration_sums_stages_and_boundary():
     assert result.per_boundary_times[0] > 0.0
 
 
-# ---- 3. simulate_isolated sums sequential models in one submesh -------------
+# ---- 3. simulate_isolated sums sequential models in one group ---------------
 
 
-def test_simulate_isolated_sums_actor_and_critic_in_same_submesh():
+def test_simulate_isolated_sums_actor_and_critic_in_same_group():
     actor = LlamaModel(
         name="actor",
         role="actor",
@@ -199,32 +199,31 @@ def test_simulate_isolated_sums_actor_and_critic_in_same_submesh():
     actor_mm = _make_mapping(actor, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
     critic_mm = _make_mapping(critic, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), Workload.PREPARATION, [0, 1])
 
-    submesh = ModelMappingGroup(model_mappings=[actor_mm, critic_mm])
+    group = ModelMappingGroup(model_mappings=[actor_mm, critic_mm])
     topo = _make_topo(num_hosts=2)
     ctx = _ctx()
 
-    isolated_time = submesh.simulate_isolated(ctx, A100, topo)
+    isolated_time = group.simulate_isolated(ctx, A100, topo)
 
     actor_alone = ModelMappingGroup(model_mappings=[actor_mm])
     critic_alone = ModelMappingGroup(model_mappings=[critic_mm])
     actor_time = actor_alone.simulate_isolated(ctx, A100, topo)
     critic_time = critic_alone.simulate_isolated(ctx, A100, topo)
 
-    # Sequential within the submesh: total ≥ actor + critic. Was strict
-    # equality pre-Phase-1 when AR sizing was 0; now actor and critic are on
-    # the same hosts and their AR transfers contend in the joint snapshot,
-    # so each per-MM component is bigger than its alone-time. The structural
-    # property under test is sum-not-max, which still holds.
+    # Sequential within the group: total ≥ actor + critic. Actor and critic
+    # are on the same hosts and their AR transfers contend in the joint
+    # snapshot, so each per-MM component is bigger than its alone-time. The
+    # structural property under test is sum-not-max, which still holds.
     assert isolated_time >= actor_time + critic_time
     # And it's not double-counting: it's bounded by 2× each component (rough sanity).
     assert isolated_time <= 2 * (actor_time + critic_time)
 
 
-# ---- 4. simulate_stage takes max over disjoint submeshes --------------------
+# ---- 4. simulate_stage takes max over disjoint groups -----------------------
 
 
-def test_simulate_stage_takes_max_over_disjoint_submeshes():
-    # Two submeshes on disjoint hosts. Different host counts → different
+def test_simulate_stage_takes_max_over_disjoint_groups():
+    # Two groups on disjoint hosts. Different host counts → different
     # parallelism shapes → different stage times → max is well-defined.
     big = LlamaModel(
         name="big",
@@ -255,18 +254,12 @@ def test_simulate_stage_takes_max_over_disjoint_submeshes():
         ctx, A100, topo,
     )
 
-    # Stage time uses max-not-sum across submeshes. Pre-Phase-1 this asserted
-    # `both == max(big_only, small_only)` because AR sizing was zero. Post-
-    # Phase-1+3, `_make_topo` puts every host pair on the same shared spine,
-    # so disjoint *hosts* don't imply disjoint *links* — every collective
-    # (TP-AR, TP-AllGather on the LM head) from big and small contends
-    # through the spine. The structural property still under test is the
-    # lower bound: `both` is at least the slowest submesh alone. The pre-
-    # Phase-3 upper bound `both < big + small` was a contention-model
-    # heuristic, not a structural invariant; with Phase 3's LM-head
-    # AllGather it no longer holds and would need a fairness-aware
-    # contention model to recover. Sanity-cap loose enough to catch any
-    # gross double-counting.
+    # Stage time uses max-not-sum across groups. `_make_topo` puts every
+    # host pair on the same shared spine, so disjoint *hosts* don't imply
+    # disjoint *links* — every collective (TP-AR, TP-AllGather on the LM
+    # head) from big and small contends through the spine. The structural
+    # property under test is the lower bound: `both` is at least the slowest
+    # group alone. Sanity-cap loose enough to catch gross double-counting.
     assert max(big_only, small_only) <= both, (
         f"simulate_stage(both)={both:.6f} should be at least max(alone)={max(big_only, small_only):.6f}"
     )
@@ -278,9 +271,9 @@ def test_simulate_stage_takes_max_over_disjoint_submeshes():
 # ---- 5. Steady-op contention reduces effective bandwidth --------------------
 
 
-def test_steady_contention_two_concurrent_submeshes_share_spine():
-    # Both submeshes do TP-AR with the same data_GB through one shared spine.
-    # When both run, the AR transfers contend; per-submesh wall time grows.
+def test_steady_contention_two_concurrent_groups_share_spine():
+    # Both groups do TP-AR with the same data_GB through one shared spine.
+    # When both run, the AR transfers contend; per-group wall time grows.
     arch = SMALL_LLAMA
     model_a = LlamaModel(name="a", role="actor", architecture=arch)
     model_b = LlamaModel(name="b", role="critic", architecture=arch)
@@ -291,16 +284,16 @@ def test_steady_contention_two_concurrent_submeshes_share_spine():
     topo = _make_topo(num_hosts=4, spine_bw_gbps=1.0, link_latency_ms=0.0)
     ctx = _ctx(prompt_len=64)
 
-    sm_a = ModelMappingGroup([mm_a])
-    sm_b = ModelMappingGroup([mm_b])
+    g_a = ModelMappingGroup([mm_a])
+    g_b = ModelMappingGroup([mm_b])
 
-    alone = simulate_stage([sm_a], ctx, A100, topo)
-    together = simulate_stage([sm_a, sm_b], ctx, A100, topo)
+    alone = simulate_stage([g_a], ctx, A100, topo)
+    together = simulate_stage([g_a, g_b], ctx, A100, topo)
 
-    # With 2 concurrent submeshes, per-submesh AR transfers see ~half the
-    # spine bandwidth → AR network time roughly doubles, total stage time
-    # (max over submeshes) grows. Disjoint topology costs would let both
-    # finish in `alone` time; shared-spine contention is what we're testing.
+    # With 2 concurrent groups, per-group AR transfers see ~half the spine
+    # bandwidth → AR network time roughly doubles, total stage time (max
+    # over groups) grows. Disjoint topology costs would let both finish in
+    # `alone` time; shared-spine contention is what we're testing.
     assert together > alone, f"expected together>alone, got together={together:.6f} alone={alone:.6f}"
 
 

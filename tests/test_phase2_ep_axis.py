@@ -25,7 +25,7 @@ from operators.llama_config import LlamaConfig
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
 from shard import Shard
-from strategies import MegatronStrategy
+from strategies import MegatronScheme
 from topo import Device
 from workload_context import Workload
 
@@ -77,7 +77,7 @@ def test_tp_and_ep_axes_coexist_on_same_mesh():
     shards along the EP axis (with TP fixed)."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    mm = MegatronStrategy(parallelism).build_mm(
+    mm = MegatronScheme(parallelism).build_mm(
         model=model,
         workload=Workload.PREPARATION,
         devices=[_dev(i) for i in range(parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp)],
@@ -102,7 +102,7 @@ def test_ep_alltoall_walks_ep_ranks_not_tp_ranks():
     TP axis it used to alias). 4-rank AllToAll has 4*3 = 12 transfers."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    mm = MegatronStrategy(parallelism).build_mm(
+    mm = MegatronScheme(parallelism).build_mm(
         model=model,
         workload=Workload.PREPARATION,
         devices=[_dev(i) for i in range(parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp)],
@@ -122,7 +122,7 @@ def test_tp_ar_with_ep_active_walks_only_tp_ranks():
     span exactly TP ranks even when EP > 1 — i.e., 2 ranks not 8."""
     model = _v3_model()
     parallelism = ParallelismConfig(tp=2, pp=1, dp=1, ep=4)
-    mm = MegatronStrategy(parallelism).build_mm(
+    mm = MegatronScheme(parallelism).build_mm(
         model=model,
         workload=Workload.PREPARATION,
         devices=[_dev(i) for i in range(parallelism.dp * parallelism.pp * parallelism.ep * parallelism.tp)],
@@ -143,7 +143,7 @@ def test_axis_validator_rejects_underprovisioned_ep_layout():
     parallelism = ParallelismConfig(tp=1, pp=1, dp=1, ep=4)
     # Bad layout: only 2 devices, parallelism promises EP=4.
     with pytest.raises(ValueError, match="EP"):
-        MegatronStrategy(parallelism).build_mm(
+        MegatronScheme(parallelism).build_mm(
             model=model,
             workload=Workload.PREPARATION,
             devices=[_dev(0), _dev(1)],
@@ -155,7 +155,7 @@ def test_axis_validator_rejects_underprovisioned_tp_layout():
     parallelism = ParallelismConfig(tp=4, pp=1, dp=1, ep=1)
     # Only 2 devices, parallelism wants TP=4.
     with pytest.raises(ValueError, match="TP"):
-        MegatronStrategy(parallelism).build_mm(
+        MegatronScheme(parallelism).build_mm(
             model=model,
             workload=Workload.PREPARATION,
             devices=[_dev(0), _dev(1)],
@@ -166,7 +166,7 @@ def test_axis_validator_silent_when_degree_is_one():
     """`parallelism.ep == 1` means no EP collective; no validation needed."""
     model = _llama_model()
     # Should construct without raising (parallelism degrees all 1).
-    MegatronStrategy(ParallelismConfig(tp=1, pp=1, dp=1, ep=1)).build_mm(
+    MegatronScheme(ParallelismConfig(tp=1, pp=1, dp=1, ep=1)).build_mm(
         model=model,
         workload=Workload.PREPARATION,
         devices=[_dev(0)],

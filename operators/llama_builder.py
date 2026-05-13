@@ -3,7 +3,7 @@ strategies decorate with sharding roles and collectives.
 
 This module is parallelism-agnostic: it emits the structural sequence of a
 Llama transformer, tagging each operator with a canonical label. A
-ParallelismStrategy walks the labeled pattern and applies its scheme-specific
+`ParallelismScheme` walks the labeled pattern and applies its scheme-specific
 rules (Megatron shard direction, requirement emission, divisibility
 validation).
 """
@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from model import Model
-from network_requirement import ParallelismConfig
 from operators.attention import DecodeAttention, PrefillAttention
 from operators.pattern import (
     LabeledOp,
@@ -108,13 +107,7 @@ class LlamaModel(Model):
     Emits a labeled pattern; the strategy applies sharding and collectives.
     """
 
-    def forward_sequence(
-        self, phase: str, parallelism: ParallelismConfig | None = None
-    ) -> list[PatternEntry]:
-        # `parallelism` is accepted for legacy callers but no longer used —
-        # the strategy now owns parallelism decisions. Phase 2b drops the
-        # parameter from the ABC signature.
-        del parallelism
+    def forward_sequence(self, phase: str) -> list[PatternEntry]:
         arch = self.architecture
         if not isinstance(arch, LlamaConfig):
             raise TypeError(
