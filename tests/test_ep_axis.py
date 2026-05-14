@@ -15,11 +15,8 @@ import pytest
 
 from hardware import HardwareSpec
 from network_op import AllToAll, AllReduceRing
-from network_requirement import (
-    CollectiveKind,
-    ParallelismConfig,
-    ParallelismGroup,
-)
+from network_requirement import CollectiveKind
+from parallelism import ParallelismConfig, ParallelismGroup
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.v3_block import V3Model

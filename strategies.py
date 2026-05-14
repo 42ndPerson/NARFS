@@ -23,30 +23,31 @@ is intentionally unaware of parallelism or placement semantics.
 """
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from hardware import HardwareSpec
 from model import Model
 from model_mapping import ModelMapping
-from network_op import NetworkOp, P2P
-from network_requirement import (
-    CollectiveKind,
-    NetworkRequirement,
-    ParallelismConfig,
-    ParallelismGroup,
-)
+from network_op import NetworkOp
+from network_requirement import CollectiveKind, NetworkRequirement
 from operator_base import Operator
 from operators.llama_config import LlamaConfig
 from operators.pattern import (
     LabeledOp,
     LayerRepeat,
+    OpRole,
     OperatorWithReqs,
     PatternEntry,
 )
 from operators.v3_config import V3Config
-from parallelism_role import EPMode, ParallelismRole, TPMode
+from parallelism import (
+    EPMode,
+    ParallelismConfig,
+    ParallelismGroup,
+    ParallelismRole,
+    TPMode,
+)
 from relation import Relation
 from shard import Shard
 from topo import Device, HostTopo
@@ -78,52 +79,33 @@ class _Decoration:
     collective: Optional[str] = None
 
 
-# Megatron canonical label → decoration table. Covers Llama and V3 vocabularies.
-_MEGATRON_LABELS: dict[str, _Decoration] = {
-    # ---- Llama labels ----
-    "llama_embed":      _Decoration(role=_REP),
-    "llama_attn_norm":  _Decoration(role=_REP),
-    "llama_qkv":        _Decoration(role=_COL),
-    "llama_rope":       _Decoration(role=_HEADS),
-    "llama_attention":  _Decoration(role=_HEADS),
-    "llama_attn_out":   _Decoration(role=_ROW, collective=_TP_AR),
-    "llama_ffn_norm":   _Decoration(role=_REP),
-    "llama_ffn_gate":   _Decoration(role=_COL),
-    "llama_ffn_up":     _Decoration(role=_COL),
-    "llama_ffn_swiglu": _Decoration(role=_COL),
-    "llama_ffn_down":   _Decoration(role=_ROW, collective=_TP_AR),
-    "llama_final_norm": _Decoration(role=_REP),
-    "llama_lm_head":    _Decoration(role=_VOCAB, collective=_TP_AG),
-    # ---- V3 top-level + dense FFN labels ----
-    "v3_embed":         _Decoration(role=_REP),
-    "v3_attn_norm":     _Decoration(role=_REP),
-    "v3_ffn_norm":      _Decoration(role=_REP),
-    "v3_ffn_gate":      _Decoration(role=_COL),
-    "v3_ffn_up":        _Decoration(role=_COL),
-    "v3_ffn_swiglu":    _Decoration(role=_COL),
-    "v3_ffn_down":      _Decoration(role=_ROW, collective=_TP_AR),
-    "v3_final_norm":    _Decoration(role=_REP),
-    "v3_lm_head":       _Decoration(role=_VOCAB, collective=_TP_AG),
-    # ---- MLA labels ----
-    "mla_q_down":       _Decoration(role=_REP),
-    "mla_q_up":         _Decoration(role=_COL),
-    "mla_kv_down":      _Decoration(role=_REP),
-    "mla_kv_up":        _Decoration(role=_COL),
-    "mla_rope":         _Decoration(role=_HEADS),
-    "mla_attention":    _Decoration(role=_HEADS),
-    "mla_attn_out":     _Decoration(role=_ROW, collective=_TP_AR),
-    # ---- MoE labels ----
-    "moe_router":       _Decoration(role=_REP),
-    "moe_dispatch":     _Decoration(role=_REP, collective=_EP_DISPATCH),
-    "moe_routed_gate":  _Decoration(role=_EP),
-    "moe_routed_up":    _Decoration(role=_EP),
-    "moe_routed_swiglu":_Decoration(role=_REP),
-    "moe_routed_down":  _Decoration(role=_EP),
-    "moe_combine":      _Decoration(role=_REP, collective=_EP_COMBINE),
-    "moe_shared_gate":  _Decoration(role=_COL),
-    "moe_shared_up":    _Decoration(role=_COL),
-    "moe_shared_swiglu":_Decoration(role=_COL),
-    "moe_shared_down":  _Decoration(role=_ROW, collective=_TP_AR),
+# Megatron canonical role → decoration table. The architecture-agnostic
+# `OpRole` taxonomy means this table covers Llama, V3 dense, V3 MLA, and
+# V3 MoE in one ~17-entry mapping — adding a new architecture that uses
+# the existing roles requires no scheme changes.
+_MEGATRON_DECORATIONS: dict[OpRole, _Decoration] = {
+    # Embedding + final projection
+    OpRole.TOKEN_EMBED:           _Decoration(role=_REP),
+    OpRole.LM_HEAD:               _Decoration(role=_VOCAB, collective=_TP_AG),
+    # Residual-stream norms
+    OpRole.NORM:                  _Decoration(role=_REP),
+    # Attention block
+    OpRole.QKV_PROJ:              _Decoration(role=_COL),
+    OpRole.LATENT_DOWN_PROJ:      _Decoration(role=_REP),
+    OpRole.ROPE:                  _Decoration(role=_HEADS),
+    OpRole.ATTN_HEADS:            _Decoration(role=_HEADS),
+    OpRole.ATTN_OUT:              _Decoration(role=_ROW, collective=_TP_AR),
+    # Dense FFN (shared MoE experts re-use these)
+    OpRole.FFN_EXPAND:            _Decoration(role=_COL),
+    OpRole.FFN_ACT:               _Decoration(role=_COL),
+    OpRole.FFN_REDUCE:            _Decoration(role=_ROW, collective=_TP_AR),
+    # MoE routing + routed experts
+    OpRole.ROUTER:                _Decoration(role=_REP),
+    OpRole.DISPATCH_MARKER:       _Decoration(role=_REP, collective=_EP_DISPATCH),
+    OpRole.COMBINE_MARKER:        _Decoration(role=_REP, collective=_EP_COMBINE),
+    OpRole.ROUTED_EXPERT_EXPAND:  _Decoration(role=_EP),
+    OpRole.ROUTED_EXPERT_ACT:     _Decoration(role=_REP),
+    OpRole.ROUTED_EXPERT_REDUCE:  _Decoration(role=_EP),
 }
 
 
@@ -206,14 +188,6 @@ def _ep_dispatched_size_fn(h: int, dtype_bytes: int, top_k: int, tc: TokenCount)
     def _fn(ctx) -> float:
         return top_k * tc.resolve(ctx) * h * dtype_bytes / 1e9
     return _fn
-
-
-def _phase_to_token_count(phase: str) -> TokenCount:
-    if phase in ("prefill", "training"):
-        return TokenCount.PREFILL
-    if phase == "decode":
-        return TokenCount.DECODE
-    raise ValueError(f"Unknown phase: {phase!r}")
 
 
 # ---- Plan -------------------------------------------------------------------
@@ -431,15 +405,15 @@ class MegatronScheme(ParallelismScheme):
     ) -> list[PatternEntry]:
         """Walk a labeled pattern; produce an OperatorWithReqs-decorated form."""
         out: list[PatternEntry] = []
-        tc = _phase_to_token_count(phase)
+        tc = TokenCount.from_phase(phase)
         for item in labeled:
             if isinstance(item, LayerRepeat):
                 decorated_members: list[OperatorWithReqs] = [
                     self._decorate_op(m, arch, tc) for m in item.members
                 ]
                 if phase == "training" and self.parallelism.dp > 1:
-                    template_labels = tuple(m.label for m in item.members)
-                    dp_ar = self._dp_grad_all_reduce(decorated_members, template_labels)
+                    template_roles = tuple(m.role for m in item.members)
+                    dp_ar = self._dp_grad_all_reduce(decorated_members, template_roles)
                     last = decorated_members[-1]
                     decorated_members[-1] = OperatorWithReqs(
                         operator=last.operator,
@@ -460,10 +434,10 @@ class MegatronScheme(ParallelismScheme):
         self, labeled: LabeledOp, arch, tc: TokenCount
     ) -> OperatorWithReqs:
         try:
-            dec = _MEGATRON_LABELS[labeled.label]
+            dec = _MEGATRON_DECORATIONS[labeled.role]
         except KeyError:
             raise ValueError(
-                f"MegatronScheme: no decoration rule for label {labeled.label!r}"
+                f"MegatronScheme: no decoration rule for role {labeled.role.name}"
             )
         op = labeled.operator
         reqs: list[NetworkRequirement] = []
@@ -524,7 +498,7 @@ class MegatronScheme(ParallelismScheme):
         raise ValueError(f"Unknown collective tag: {kind_tag!r}")
 
     def _dp_grad_all_reduce(
-        self, layer_members: list[OperatorWithReqs], template_labels: tuple,
+        self, layer_members: list[OperatorWithReqs], template_roles: tuple,
     ) -> NetworkRequirement:
         total_GB = sum(m.per_rank_parameter_bytes for m in layer_members) / 1e9
         return NetworkRequirement(
@@ -532,7 +506,7 @@ class MegatronScheme(ParallelismScheme):
             relation=Relation.EXCLUSIVE,
             eta=1.0,
             group=ParallelismGroup.DP,
-            payload_id=("dp_grad", template_labels),
+            payload_id=("dp_grad", template_roles),
             data_GB_fn=lambda _ctx, _v=total_GB: _v,
         )
 
@@ -575,131 +549,19 @@ def assemble(
 
 
 # ---- resharding -------------------------------------------------------------
-#
-# A `ReshardingStrategy` converts a `(source_mapping, dest_mapping)` pair
-# into `NetworkOp`s that physically move parameter bytes from the source's
-# parallelism layout to the destination's. Resharding lives alongside the
-# parallelism schemes because the byte-movement pattern is determined by
-# how each side's scheme lays weights out across ranks — Megatron-to-
-# Megatron is the v1 case; HybridFlow's 3D HybridEngine wants its own
-# strategy that exploits micro-DP AllGather instead of P2P.
 
 
-@dataclass(frozen=True)
-class _ParameterTensor:
-    """A single weight tensor with the info needed to compute per-rank slices.
-
-    shard_axis:
-      0  → row-parallel (split rows across TP)
-      1  → column-parallel (split cols across TP)
-      None → fully replicated across TP
-    pp_anchor:
-      "first" → lives on PP rank 0 (embedding)
-      "last"  → lives on PP rank pp_size - 1 (LM head)
-      "layer" → derived from layer_id × pp_size // n_layers
-    """
-
-    name: str
-    shape: tuple[int, int]
-    dtype_bytes: int
-    layer_id: Optional[int] = None
-    shard_axis: Optional[int] = None
-    pp_anchor: str = "layer"
-
-
-def _llama_parameters(arch: LlamaConfig) -> list[_ParameterTensor]:
-    """Llama parameter list under the Megatron-style natural sharding scheme.
-
-    QKV column-parallel, attention output row-parallel, FFN gate/up
-    column-parallel, FFN down row-parallel, embedding+LM head vocab-parallel.
-    Norm scales (RMSNorm) are negligible and intentionally omitted; total
-    parameter accounting differs by O(n_layers · h) bytes.
-    """
-    out: list[_ParameterTensor] = []
-    out.append(_ParameterTensor(
-        name="embed",
-        shape=(arch.vocab, arch.h),
-        dtype_bytes=arch.dtype_bytes,
-        shard_axis=0,
-        pp_anchor="first",
-    ))
-    n_qkv = arch.n_q + 2 * arch.n_kv
-    for layer_id in range(arch.n_layers):
-        out.append(_ParameterTensor(
-            name=f"qkv_l{layer_id}",
-            shape=(n_qkv * arch.head_size, arch.h),
-            dtype_bytes=arch.dtype_bytes,
-            layer_id=layer_id, shard_axis=0, pp_anchor="layer",
-        ))
-        out.append(_ParameterTensor(
-            name=f"o_l{layer_id}",
-            shape=(arch.h, arch.n_q * arch.head_size),
-            dtype_bytes=arch.dtype_bytes,
-            layer_id=layer_id, shard_axis=1, pp_anchor="layer",
-        ))
-        out.append(_ParameterTensor(
-            name=f"gate_l{layer_id}",
-            shape=(arch.m, arch.h),
-            dtype_bytes=arch.dtype_bytes,
-            layer_id=layer_id, shard_axis=0, pp_anchor="layer",
-        ))
-        out.append(_ParameterTensor(
-            name=f"up_l{layer_id}",
-            shape=(arch.m, arch.h),
-            dtype_bytes=arch.dtype_bytes,
-            layer_id=layer_id, shard_axis=0, pp_anchor="layer",
-        ))
-        out.append(_ParameterTensor(
-            name=f"down_l{layer_id}",
-            shape=(arch.h, arch.m),
-            dtype_bytes=arch.dtype_bytes,
-            layer_id=layer_id, shard_axis=1, pp_anchor="layer",
-        ))
-    out.append(_ParameterTensor(
-        name="lm_head",
-        shape=(arch.vocab, arch.h),
-        dtype_bytes=arch.dtype_bytes,
-        shard_axis=0, pp_anchor="last",
-    ))
-    return out
-
-
-def _pp_rank_for(param: _ParameterTensor, pp_size: int, n_layers: int) -> int:
-    if param.pp_anchor == "first":
-        return 0
-    if param.pp_anchor == "last":
-        return pp_size - 1
-    if param.pp_anchor == "layer":
-        if param.layer_id is None:
-            raise ValueError(f"layer-anchored param {param.name} missing layer_id")
-        return (param.layer_id * pp_size) // n_layers
-    raise ValueError(f"Unknown pp_anchor: {param.pp_anchor!r}")
-
-
-def _shards_at(mapping: ModelMapping, dp: int, pp: int) -> dict[int, Shard]:
-    """Returns {tp_rank: Shard} for the given (dp, pp) coordinate."""
-    return {
-        s.tp: s
-        for s in mapping.shards_to_devices
-        if s.dp == dp and s.pp == pp
-    }
-
-
-def llama_total_parameter_bytes(arch: LlamaConfig) -> int:
-    """Sum of parameter bytes for a Llama model under the natural sharding scheme.
-
-    Exposed so tests can compare resharding bytes against the architectural
-    target. Mirrors `_llama_parameters`.
-    """
-    return sum(p.shape[0] * p.shape[1] * p.dtype_bytes for p in _llama_parameters(arch))
-
-
-class ReshardingStrategy(ABC):
+class ReshardingScheme(ABC):
     """Computes the NetworkOps that physically move parameter bytes from one
-    parallelism layout to another. Concrete strategies are typically paired
-    with the schemes on both sides (e.g. `MegatronToMegatronP2P` between
-    two Megatron layouts; a future `HybridFlowMicroDPAllGather` for
-    HybridFlow's 3D HybridEngine resharding).
+    parallelism layout to another.
+
+    Concrete schemes are paired with the parallelism schemes on both sides
+    — `MegatronToMegatronP2P` (in `operators/llama_resharding.py`) handles
+    two Megatron layouts; a future `HybridFlowMicroDPAllGather` would handle
+    HybridFlow's 3D HybridEngine resharding. The byte-movement pattern is
+    determined by how each side's scheme lays weights out across ranks,
+    which is why resharding lives in the strategy layer rather than the
+    core simulator.
     """
 
     @abstractmethod
@@ -707,107 +569,5 @@ class ReshardingStrategy(ABC):
         self, source: ModelMapping, dest: ModelMapping,
     ) -> list[NetworkOp]:
         ...
-
-
-class MegatronToMegatronP2P(ReshardingStrategy):
-    """Resharding between two Megatron layouts via per-host-pair P2P.
-
-    For each parameter tensor, computes (src_device, dst_device) byte
-    movements under the natural Megatron sharding scheme (QKV column-
-    parallel, O row-parallel, gate/up column-parallel, down row-parallel,
-    embed + LM head vocab-parallel), aggregates by device pair, and emits
-    one P2P per non-zero pair.
-
-    Treats DP as canonical (dp=0 source → dp=0 dest); a real implementation
-    would also broadcast to other DP replicas, but the extra fan-out is the
-    same parameter set replicated and orthogonal to the resharding cost
-    modeled here.
-
-    Currently supports only LlamaConfig models. V3 (with MoE expert
-    sharding) requires a separate enumeration and is left for a later phase.
-    """
-
-    def compute_network_ops(
-        self, source: ModelMapping, dest: ModelMapping,
-    ) -> list[NetworkOp]:
-        arch = source.model.architecture
-        if not isinstance(arch, LlamaConfig):
-            raise NotImplementedError(
-                "MegatronToMegatronP2P only supports LlamaConfig models in v1; "
-                "V3 / MoE resharding will need its own enumeration."
-            )
-
-        params = _llama_parameters(arch)
-        n_layers = arch.n_layers
-
-        agg: dict[tuple[Device, Device], int] = defaultdict(int)
-        for p in params:
-            for pair, bytes_moved in self._movements_for_param(
-                p, source, dest, n_layers
-            ).items():
-                agg[pair] += bytes_moved
-
-        ops: list[NetworkOp] = []
-        for (src_device, dst_device), bytes_total in agg.items():
-            if bytes_total <= 0:
-                continue
-            ops.append(P2P(
-                endpoint_pairs=[(src_device, dst_device)],
-                total_data_GB=bytes_total / 1e9,
-            ))
-        return ops
-
-    def _movements_for_param(
-        self,
-        param: _ParameterTensor,
-        source: ModelMapping,
-        dest: ModelMapping,
-        n_layers: int,
-    ) -> dict[tuple[Device, Device], int]:
-        src_pp = _pp_rank_for(param, source.parallelism.pp, n_layers)
-        dst_pp = _pp_rank_for(param, dest.parallelism.pp, n_layers)
-        src_shards = _shards_at(source, dp=0, pp=src_pp)
-        dst_shards = _shards_at(dest, dp=0, pp=dst_pp)
-        if not src_shards or not dst_shards:
-            return {}
-
-        rows, cols = param.shape
-        movements: dict[tuple[Device, Device], int] = defaultdict(int)
-
-        if param.shard_axis is None:
-            src_device = source.shards_to_devices[src_shards[0]]
-            dst_device = dest.shards_to_devices[dst_shards[0]]
-            movements[(src_device, dst_device)] = rows * cols * param.dtype_bytes
-            return movements
-
-        sharded_dim = param.shape[param.shard_axis]
-        other_dim = param.shape[1 - param.shard_axis]
-        src_tp = source.parallelism.tp
-        dst_tp = dest.parallelism.tp
-
-        if sharded_dim % src_tp != 0:
-            raise ValueError(
-                f"Param {param.name}: shard dim {sharded_dim} not divisible by "
-                f"source tp {src_tp}"
-            )
-        if sharded_dim % dst_tp != 0:
-            raise ValueError(
-                f"Param {param.name}: shard dim {sharded_dim} not divisible by "
-                f"dest tp {dst_tp}"
-            )
-        src_chunk = sharded_dim // src_tp
-        dst_chunk = sharded_dim // dst_tp
-
-        for src_t in range(src_tp):
-            src_lo, src_hi = src_t * src_chunk, (src_t + 1) * src_chunk
-            src_device = source.shards_to_devices[src_shards[src_t]]
-            for dst_t in range(dst_tp):
-                dst_lo, dst_hi = dst_t * dst_chunk, (dst_t + 1) * dst_chunk
-                overlap = max(0, min(src_hi, dst_hi) - max(src_lo, dst_lo))
-                if overlap == 0:
-                    continue
-                dst_device = dest.shards_to_devices[dst_shards[dst_t]]
-                movements[(src_device, dst_device)] += overlap * other_dim * param.dtype_bytes
-        return movements
 
 

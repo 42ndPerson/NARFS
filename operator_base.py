@@ -1,6 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from hardware import HardwareSpec
 from workload_context import WorkloadContext
@@ -18,11 +18,10 @@ class Operator(ABC):
     hardware and bakes the per-rank arithmetic into `CombinedOp`'s
     `compute_time_fn` closure at MM construction time. The operator itself
     never sees parallelism degrees.
+
+    The roofline crossover is implicit in `kernel_time = max(compute_time,
+    memory_time)` — there is no separate compute-bound/memory-bound flag.
     """
-    # Static fallback used when an operator's "smallness" doesn't depend on ctx.
-    # For ctx-aware cases (Gemm with M = microbatch * prompt_len), override
-    # is_small_dim instead.
-    small_dim: bool = field(default=False, kw_only=True)
 
     @abstractmethod
     def compute_flops(self, ctx: WorkloadContext) -> float:
@@ -34,15 +33,11 @@ class Operator(ABC):
         """Full-model memory traffic in bytes at the given ctx."""
         raise NotImplementedError
 
-    @abstractmethod
-    def is_compute_bound(
-        self, ctx: WorkloadContext, hw: HardwareSpec
-    ) -> bool:
-        raise NotImplementedError
-
     def is_small_dim(self, ctx: WorkloadContext) -> bool:
+        """Whether the kernel hits the small-GEMM efficiency tier. Only
+        `Gemm` has a shape-dependent answer; everything else is False."""
         del ctx
-        return self.small_dim
+        return False
 
     # ----- efficiency selection (overridable per operator type) -----------------
     # Default: just `hw.compute_efficiency` / `hw.memory_efficiency`. Operator

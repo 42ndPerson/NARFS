@@ -18,12 +18,8 @@ This module pins the new behavior:
 """
 from __future__ import annotations
 
-from network_requirement import (
-    CollectiveKind,
-    NetworkRequirement,
-    ParallelismConfig,
-    ParallelismGroup,
-)
+from network_requirement import CollectiveKind, NetworkRequirement
+from parallelism import ParallelismConfig, ParallelismGroup
 from operators.pattern import expand_tagged_pattern, split_pattern
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig

@@ -4,8 +4,9 @@ from dataclasses import dataclass, field
 from hardware import HardwareSpec
 from model_mapping import ModelMapping
 from network_op import NetworkOp
+from operators.llama_resharding import MegatronToMegatronP2P
 from relation import NetworkPhase
-from strategies import MegatronToMegatronP2P, ReshardingStrategy
+from strategies import ReshardingScheme
 from topo import HostTopo
 
 
@@ -13,9 +14,10 @@ from topo import HostTopo
 class StageTransition:
     """Resharding hop between two ModelMappings of the same model.
 
-    Strategy is pluggable to accommodate optimized 3D-hybrid resharding
-    patterns (e.g. HybridFlow's micro-DP AllGather) — those return their own
-    NetworkOp subclasses, and StageTransition consumes them uniformly.
+    The resharding scheme is pluggable to accommodate optimized 3D-hybrid
+    resharding patterns (e.g. HybridFlow's micro-DP AllGather) — those
+    return their own NetworkOp subclasses, and StageTransition consumes
+    them uniformly.
 
     All resharding NetworkOps must be BOUNDARY phase (one-shot, flow-time
     contention). __post_init__ validates this invariant.
@@ -23,7 +25,7 @@ class StageTransition:
 
     source: ModelMapping
     dest: ModelMapping
-    strategy: ReshardingStrategy = field(default_factory=MegatronToMegatronP2P)
+    scheme: ReshardingScheme = field(default_factory=MegatronToMegatronP2P)
     network_ops: list[NetworkOp] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
@@ -32,7 +34,7 @@ class StageTransition:
                 "StageTransition requires identical model on both sides; "
                 f"got source={self.source.model.name!r}, dest={self.dest.model.name!r}"
             )
-        ops = self.strategy.compute_network_ops(self.source, self.dest)
+        ops = self.scheme.compute_network_ops(self.source, self.dest)
         for op in ops:
             phase = NetworkOp.phase_of(op)
             if phase is not NetworkPhase.BOUNDARY:

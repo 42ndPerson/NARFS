@@ -2,27 +2,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from hardware import HardwareSpec
 from operator_base import Operator
 from operators.elementwise import SwiGLUActivation
 from operators.gemm import Gemm
-from operators.pattern import LabeledOp
+from operators.pattern import LabeledOp, OpRole
 from operators.v3_config import V3Config
 from workload_context import WorkloadContext
-
-
-# Canonical MoE labels.
-MOE_ROUTER = "moe_router"
-MOE_DISPATCH = "moe_dispatch"
-MOE_ROUTED_GATE = "moe_routed_gate"
-MOE_ROUTED_UP = "moe_routed_up"
-MOE_ROUTED_SWIGLU = "moe_routed_swiglu"
-MOE_ROUTED_DOWN = "moe_routed_down"
-MOE_COMBINE = "moe_combine"
-MOE_SHARED_GATE = "moe_shared_gate"
-MOE_SHARED_UP = "moe_shared_up"
-MOE_SHARED_SWIGLU = "moe_shared_swiglu"
-MOE_SHARED_DOWN = "moe_shared_down"
 
 
 @dataclass(frozen=True)
@@ -37,10 +22,6 @@ class DispatchMarker(Operator):
         del ctx
         return 0.0
 
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False
-
 
 @dataclass(frozen=True)
 class CombineMarker(Operator):
@@ -53,10 +34,6 @@ class CombineMarker(Operator):
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         del ctx
         return 0.0
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False
 
 
 def build_moe_ffn(
@@ -80,36 +57,37 @@ def build_moe_ffn(
     )
 
     return [
-        LabeledOp(MOE_ROUTER, Gemm(
+        LabeledOp(OpRole.ROUTER, Gemm(
             n=n_routed, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t,
         )),
-        LabeledOp(MOE_DISPATCH, DispatchMarker()),
-        LabeledOp(MOE_ROUTED_GATE, Gemm(
+        LabeledOp(OpRole.DISPATCH_MARKER, DispatchMarker()),
+        LabeledOp(OpRole.ROUTED_EXPERT_EXPAND, Gemm(
             n=cfg.m_expert, k=cfg.h, dtype_bytes=dtype,
             n_replicas=n_routed, replicas_active=top_k, derive_M=expert_M,
         )),
-        LabeledOp(MOE_ROUTED_UP, Gemm(
+        LabeledOp(OpRole.ROUTED_EXPERT_EXPAND, Gemm(
             n=cfg.m_expert, k=cfg.h, dtype_bytes=dtype,
             n_replicas=n_routed, replicas_active=top_k, derive_M=expert_M,
         )),
-        LabeledOp(MOE_ROUTED_SWIGLU, SwiGLUActivation(
+        LabeledOp(OpRole.ROUTED_EXPERT_ACT, SwiGLUActivation(
             intermediate_size=cfg.m_expert, dtype_bytes=dtype, derive_t=expert_M,
         )),
-        LabeledOp(MOE_ROUTED_DOWN, Gemm(
+        LabeledOp(OpRole.ROUTED_EXPERT_REDUCE, Gemm(
             n=cfg.h, k=cfg.m_expert, dtype_bytes=dtype,
             n_replicas=n_routed, replicas_active=top_k, derive_M=expert_M,
         )),
-        LabeledOp(MOE_COMBINE, CombineMarker()),
-        LabeledOp(MOE_SHARED_GATE, Gemm(
+        LabeledOp(OpRole.COMBINE_MARKER, CombineMarker()),
+        # Shared experts are just a dense FFN path — re-use the FFN roles.
+        LabeledOp(OpRole.FFN_EXPAND, Gemm(
             n=cfg.m_expert, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t,
         )),
-        LabeledOp(MOE_SHARED_UP, Gemm(
+        LabeledOp(OpRole.FFN_EXPAND, Gemm(
             n=cfg.m_expert, k=cfg.h, dtype_bytes=dtype, derive_M=derive_t,
         )),
-        LabeledOp(MOE_SHARED_SWIGLU, SwiGLUActivation(
+        LabeledOp(OpRole.FFN_ACT, SwiGLUActivation(
             intermediate_size=cfg.m_expert, dtype_bytes=dtype, derive_t=derive_t,
         )),
-        LabeledOp(MOE_SHARED_DOWN, Gemm(
+        LabeledOp(OpRole.FFN_REDUCE, Gemm(
             n=cfg.h, k=cfg.m_expert, dtype_bytes=dtype, derive_M=derive_t,
         )),
     ]

@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from hardware import HardwareSpec
 from operator_base import Operator
 from workload_context import TokenCount, WorkloadContext
 
@@ -48,10 +47,6 @@ class RMSNorm(Operator):
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         return 2.0 * self._t(ctx) * self.hidden_size * self.dtype_bytes
 
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False
-
 
 @dataclass(frozen=True)
 class SwiGLUActivation(Operator):
@@ -75,10 +70,6 @@ class SwiGLUActivation(Operator):
 
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         return 3.0 * self._t(ctx) * self.intermediate_size * self.dtype_bytes
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False
 
 
 @dataclass(frozen=True)
@@ -108,7 +99,3 @@ class RoPE(Operator):
 
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         return 2.0 * self._t(ctx) * self.num_heads * self.rope_dim * self.dtype_bytes
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False

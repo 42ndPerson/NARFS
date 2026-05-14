@@ -1,11 +1,10 @@
-"""Llama architecture builder. Produces labeled operator patterns that
-strategies decorate with sharding roles and collectives.
+"""Llama architecture builder. Emits operators tagged with semantic
+`OpRole`s; the `ParallelismScheme` decorates them with sharding decisions.
 
-This module is parallelism-agnostic: it emits the structural sequence of a
-Llama transformer, tagging each operator with a canonical label. A
-`ParallelismScheme` walks the labeled pattern and applies its scheme-specific
-rules (Megatron shard direction, requirement emission, divisibility
-validation).
+This module is parallelism-agnostic: it emits the structural sequence of
+a Llama transformer using the shared `OpRole` taxonomy, so a new scheme
+can support Llama (and every other architecture using the same roles) by
+defining one role→decoration table.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ from operators.attention import DecodeAttention, PrefillAttention
 from operators.pattern import (
     LabeledOp,
     LayerRepeat,
+    OpRole,
     PatternEntry,
 )
 from operators.elementwise import RMSNorm, RoPE, SwiGLUActivation
@@ -22,31 +22,6 @@ from operators.embed import TokenEmbedding
 from operators.gemm import Gemm
 from operators.llama_config import LlamaConfig
 from workload_context import TokenCount
-
-
-# Canonical labels for Llama operators. Strategies look these up in their
-# label→decision tables to decide sharding, collective emission, etc.
-LLAMA_EMBED = "llama_embed"
-LLAMA_ATTN_NORM = "llama_attn_norm"
-LLAMA_QKV = "llama_qkv"
-LLAMA_ROPE = "llama_rope"
-LLAMA_ATTENTION = "llama_attention"
-LLAMA_ATTN_OUT = "llama_attn_out"
-LLAMA_FFN_NORM = "llama_ffn_norm"
-LLAMA_FFN_GATE = "llama_ffn_gate"
-LLAMA_FFN_UP = "llama_ffn_up"
-LLAMA_FFN_SWIGLU = "llama_ffn_swiglu"
-LLAMA_FFN_DOWN = "llama_ffn_down"
-LLAMA_FINAL_NORM = "llama_final_norm"
-LLAMA_LM_HEAD = "llama_lm_head"
-
-
-def _phase_to_token_count(phase: str) -> TokenCount:
-    if phase in ("prefill", "training"):
-        return TokenCount.PREFILL
-    if phase == "decode":
-        return TokenCount.DECODE
-    raise ValueError(f"Unknown phase: {phase!r}")
 
 
 def build_llama_layer(arch: LlamaConfig, phase: str) -> list[LabeledOp]:
@@ -57,7 +32,7 @@ def build_llama_layer(arch: LlamaConfig, phase: str) -> list[LabeledOp]:
     requirements externally and bakes per-rank arithmetic into the
     CombinedOp closure.
     """
-    tc = _phase_to_token_count(phase)
+    tc = TokenCount.from_phase(phase)
     qkv_n = (arch.n_q + 2 * arch.n_kv) * arch.head_size
     q_dim = arch.n_q * arch.head_size
 
@@ -78,24 +53,24 @@ def build_llama_layer(arch: LlamaConfig, phase: str) -> list[LabeledOp]:
         )
 
     return [
-        LabeledOp(LLAMA_ATTN_NORM, RMSNorm(arch.h, tc, arch.dtype_bytes)),
-        LabeledOp(LLAMA_QKV, Gemm(n=qkv_n, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes)),
-        LabeledOp(LLAMA_ROPE, RoPE(
+        LabeledOp(OpRole.NORM, RMSNorm(arch.h, tc, arch.dtype_bytes)),
+        LabeledOp(OpRole.QKV_PROJ, Gemm(n=qkv_n, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes)),
+        LabeledOp(OpRole.ROPE, RoPE(
             num_heads=arch.n_q + arch.n_kv,
             head_size=arch.head_size,
             rope_dim=arch.rope_dim,
             token_count=tc,
             dtype_bytes=arch.dtype_bytes,
         )),
-        LabeledOp(LLAMA_ATTENTION, attention),
-        LabeledOp(LLAMA_ATTN_OUT, Gemm(n=arch.h, k=q_dim, token_count=tc, dtype_bytes=arch.dtype_bytes)),
-        LabeledOp(LLAMA_FFN_NORM, RMSNorm(arch.h, tc, arch.dtype_bytes)),
-        LabeledOp(LLAMA_FFN_GATE, Gemm(n=arch.m, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes)),
-        LabeledOp(LLAMA_FFN_UP, Gemm(n=arch.m, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes)),
-        LabeledOp(LLAMA_FFN_SWIGLU, SwiGLUActivation(
+        LabeledOp(OpRole.ATTN_HEADS, attention),
+        LabeledOp(OpRole.ATTN_OUT, Gemm(n=arch.h, k=q_dim, token_count=tc, dtype_bytes=arch.dtype_bytes)),
+        LabeledOp(OpRole.NORM, RMSNorm(arch.h, tc, arch.dtype_bytes)),
+        LabeledOp(OpRole.FFN_EXPAND, Gemm(n=arch.m, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes)),
+        LabeledOp(OpRole.FFN_EXPAND, Gemm(n=arch.m, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes)),
+        LabeledOp(OpRole.FFN_ACT, SwiGLUActivation(
             intermediate_size=arch.m, token_count=tc, dtype_bytes=arch.dtype_bytes,
         )),
-        LabeledOp(LLAMA_FFN_DOWN, Gemm(n=arch.h, k=arch.m, token_count=tc, dtype_bytes=arch.dtype_bytes)),
+        LabeledOp(OpRole.FFN_REDUCE, Gemm(n=arch.h, k=arch.m, token_count=tc, dtype_bytes=arch.dtype_bytes)),
     ]
 
 
@@ -114,14 +89,14 @@ class LlamaModel(Model):
                 f"LlamaModel requires LlamaConfig, got {type(arch).__name__}"
             )
 
-        tc = _phase_to_token_count(phase)
+        tc = TokenCount.from_phase(phase)
         return [
-            LabeledOp(LLAMA_EMBED, TokenEmbedding(
+            LabeledOp(OpRole.TOKEN_EMBED, TokenEmbedding(
                 vocab=arch.vocab, h=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes,
             )),
             LayerRepeat(arch.n_layers, build_llama_layer(arch, phase)),
-            LabeledOp(LLAMA_FINAL_NORM, RMSNorm(arch.h, tc, arch.dtype_bytes)),
-            LabeledOp(LLAMA_LM_HEAD, Gemm(
+            LabeledOp(OpRole.NORM, RMSNorm(arch.h, tc, arch.dtype_bytes)),
+            LabeledOp(OpRole.LM_HEAD, Gemm(
                 n=arch.vocab, k=arch.h, token_count=tc, dtype_bytes=arch.dtype_bytes,
             )),
         ]

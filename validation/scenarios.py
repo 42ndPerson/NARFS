@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from hardware import HardwareSpec
 from model import ArchitectureConfig
-from network_requirement import ParallelismConfig
+from parallelism import ParallelismConfig
 from model import Model
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
@@ -31,14 +31,12 @@ from workload_context import Workload, WorkloadContext
 A100_80GB = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
-    ridge_flops_per_byte=156.0,
     # default efficiency factors: 0.7 / 0.8 / 0.4
 )
 
 H100_80GB = HardwareSpec(
     peak_compute_flops=989e12,
     peak_memory_bandwidth=3.35e12,
-    ridge_flops_per_byte=295.0,
 )
 
 

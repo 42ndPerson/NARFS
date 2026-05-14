@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from hardware import HardwareSpec
 from operator_base import Operator
 from workload_context import WorkloadContext
 
@@ -43,10 +42,6 @@ class PrefillAttention(Operator):
             / self.flash_block_size
             * self.dtype_bytes
         )
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False  # FlashAttention prefill is memory-bound on A100/H100
 
 
 @dataclass(frozen=True)
@@ -97,7 +92,3 @@ class DecodeAttention(Operator):
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         kv_bytes = float(self.kv_bytes_per_token or 0)
         return ctx.microbatch_size * self.avg_context_length(ctx) * kv_bytes
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False

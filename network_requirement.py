@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Hashable, Optional
 
+from parallelism import ParallelismGroup
 from relation import Relation
 
 if TYPE_CHECKING:
@@ -17,13 +18,6 @@ class CollectiveKind(Enum):
     ALL_TO_ALL_COMBINE = "all_to_all_combine"
     P2P_PIPELINE_FORWARD = "p2p_pipeline_forward"
     P2P_PIPELINE_BACKWARD = "p2p_pipeline_backward"
-
-
-class ParallelismGroup(Enum):
-    TP = "tp"
-    EP = "ep"
-    PP = "pp"
-    DP = "dp"
 
 
 @dataclass(frozen=True)
@@ -71,11 +65,3 @@ class NetworkRequirement:
             (1.0 - self.eta) * (kernel_time + network_time)
             + self.eta * max(kernel_time, network_time)
         )
-
-
-@dataclass(frozen=True)
-class ParallelismConfig:
-    tp: int = 1
-    pp: int = 1
-    dp: int = 1
-    ep: int = 1

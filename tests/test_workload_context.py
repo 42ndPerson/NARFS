@@ -20,7 +20,6 @@ from workload_context import (
 A100 = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
-    ridge_flops_per_byte=156.0,
 )
 
 

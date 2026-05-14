@@ -5,11 +5,8 @@ import pytest
 from hardware import HardwareSpec
 from model_mapping import ModelMapping
 from network_op import AllReduceRing
-from network_requirement import (
-    CollectiveKind,
-    ParallelismConfig,
-    ParallelismGroup,
-)
+from network_requirement import CollectiveKind
+from parallelism import ParallelismConfig, ParallelismGroup
 from operators.backward import BackwardOp
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
@@ -40,7 +37,6 @@ SMALL_LLAMA = LlamaConfig(
 A100 = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
-    ridge_flops_per_byte=156.0,
 )
 
 

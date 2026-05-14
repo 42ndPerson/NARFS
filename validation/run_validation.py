@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from model_mapping import ModelMapping, SimulationResult
-from network_requirement import ParallelismConfig
+from parallelism import ParallelismConfig
 from operator_base import Operator
 from simulator import simulate_rlhf_iteration
 from stages import RLHFTimeline

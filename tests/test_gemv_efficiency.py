@@ -25,7 +25,6 @@ from workload_context import (
 A100 = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
-    ridge_flops_per_byte=156.0,
     # explicit defaults so tests don't break if HardwareSpec defaults shift
     compute_efficiency=0.7,
     memory_efficiency=0.8,

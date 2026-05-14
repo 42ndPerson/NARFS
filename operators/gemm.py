@@ -63,9 +63,6 @@ class Gemm(Operator):
         m = self._m(ctx)
         return float(self.dtype_bytes) * (m * self.k + self.k * self.n + m * self.n)
 
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        return self.compute_flops(ctx) / self.memory_bytes(ctx) > hw.ridge_flops_per_byte
-
     def is_small_dim(self, ctx: WorkloadContext) -> bool:
         return min(self._m(ctx), self.n, self.k) < 1024
 

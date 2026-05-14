@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from hardware import HardwareSpec
 from operator_base import Operator
 from workload_context import WorkloadContext
 
@@ -37,7 +36,3 @@ class AdamOptimizerOp(Operator):
             (2 * self.dtype_bytes_param + 3 * self.dtype_bytes_state)
             * self.num_parameters
         )
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False

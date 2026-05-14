@@ -12,6 +12,9 @@ from workload_context import Workload, WorkloadContext
 class ConcreteOp(Operator):
     flops: float = 0.0
     bytes_: float = 0.0
+    # Test-only flag: drives the efficiency-tier override below. Real
+    # operators that need a shape-dependent answer override `is_small_dim`.
+    small_dim: bool = False
 
     def compute_flops(self, ctx: WorkloadContext) -> float:
         del ctx
@@ -20,10 +23,6 @@ class ConcreteOp(Operator):
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         del ctx
         return self.bytes_
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return self.flops >= self.bytes_
 
     def compute_efficiency_factor(
         self, ctx: WorkloadContext, hw: HardwareSpec
@@ -51,7 +50,6 @@ def hw() -> HardwareSpec:
     return HardwareSpec(
         peak_compute_flops=1e15,
         peak_memory_bandwidth=1e12,
-        ridge_flops_per_byte=156.0,
         compute_efficiency=0.5,
         memory_efficiency=0.5,
         small_gemm_efficiency=0.25,

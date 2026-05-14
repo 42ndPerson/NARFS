@@ -14,12 +14,7 @@ from network_op import (
     P2P,
     ReduceScatterRing,
 )
-from network_requirement import (
-    CollectiveKind,
-    NetworkRequirement,
-    ParallelismConfig,
-    ParallelismGroup,
-)
+from network_requirement import CollectiveKind, NetworkRequirement
 from operator_base import Operator
 from operators.backward import derive_backward_pattern
 from operators.pattern import (
@@ -28,6 +23,7 @@ from operators.pattern import (
     expand_pattern_with_layers,
 )
 from operators.optimizer import AdamOptimizerOp
+from parallelism import ParallelismConfig, ParallelismGroup
 from relation import NetworkPhase, Relation
 from shard import Shard
 from topo import Device
@@ -96,7 +92,6 @@ class SimulationResult:
 _PARTITION_REF_HW = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
-    ridge_flops_per_byte=156.0,
 )
 
 

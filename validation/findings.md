@@ -1,4 +1,4 @@
-# Simulator validation findings — 2026-05-13T07:13:10Z
+# Simulator validation findings — 2026-05-14T09:55:17Z
 
 Generated automatically by `run_validation.py` whenever any scenario is more than 30% off its published reference. Default tolerance is 50%; training and DeepSeek-V3 are tagged as sanity bounds (100%).
 

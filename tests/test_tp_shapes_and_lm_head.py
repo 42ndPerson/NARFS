@@ -1,29 +1,24 @@
-"""Phase 3 (updated for Phase 2c — parallelism-pure operators):
-strategy-applied TP sharding + LM-head AllGather.
+"""Strategy-applied TP sharding + LM-head AllGather.
 
-After Phase 2c the operator no longer carries a `parallelism_role` or
-exposes role-aware `_shape` / `_heads` helpers. The strategy stores its
-sharding decisions externally via `OperatorWithReqs.compute_time_fn`
-(per-rank kernel-time closure) and `per_rank_parameter_bytes` (per-rank
+Operators are parallelism-pure: they carry no sharding role and expose no
+role-aware shape helpers. The `ParallelismScheme` stores its sharding
+decisions externally on `OperatorWithReqs` — `compute_time_fn` (the
+per-rank kernel-time closure) and `per_rank_parameter_bytes` (the per-rank
 weight footprint). These tests pin the *outcome* of sharding — that the
 per-rank footprint and kernel time at TP=4 are 1/4 of TP=1 for sharded
 operators — and pin the LM-head AllGather requirement.
 
-Direction-of-shard distinctions (COL vs ROW vs HEADS) are no longer visible
-at the operator level; that's the acknowledged ±30% approximation in
-Phase 2c (per-rank tile shape asymmetry isn't modeled).
+Direction-of-shard distinctions (column vs row vs heads) are not visible
+at the operator level; that's the acknowledged ±30% approximation in the
+per-rank baking (per-rank tile-shape asymmetry isn't modeled).
 """
 from __future__ import annotations
 
 import pytest
 
 from hardware import HardwareSpec
-from network_requirement import (
-    CollectiveKind,
-    NetworkRequirement,
-    ParallelismConfig,
-    ParallelismGroup,
-)
+from network_requirement import CollectiveKind, NetworkRequirement
+from parallelism import ParallelismConfig, ParallelismGroup
 from operators.attention import DecodeAttention
 from operators.gemm import Gemm
 from operators.llama_builder import LlamaModel
@@ -48,7 +43,6 @@ SMALL_LLAMA = LlamaConfig(
 _HW = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
-    ridge_flops_per_byte=156.0,
 )
 
 

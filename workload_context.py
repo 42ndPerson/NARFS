@@ -24,6 +24,22 @@ class TokenCount(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+    @classmethod
+    def from_phase(cls, phase: "str | TokenCount") -> "TokenCount":
+        """Map a phase name to the TokenCount it implies.
+
+        "prefill" and "training" both walk full prompt sequences ⇒ PREFILL;
+        "decode" ⇒ DECODE. Idempotent on `TokenCount` inputs so builders can
+        accept either a phase string or an already-resolved TokenCount.
+        """
+        if isinstance(phase, TokenCount):
+            return phase
+        if phase in ("prefill", "training"):
+            return cls.PREFILL
+        if phase == "decode":
+            return cls.DECODE
+        raise ValueError(f"Unknown phase: {phase!r}")
+
     def resolve(self, ctx: "WorkloadContext") -> int:
         if self is TokenCount.PREFILL:
             return ctx.microbatch_size * ctx.prompt_len

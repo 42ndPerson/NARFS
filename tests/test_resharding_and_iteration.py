@@ -12,17 +12,17 @@ from network_op import (
     NetworkOp,
     P2P,
 )
-from network_requirement import ParallelismConfig
+from parallelism import ParallelismConfig
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import NetworkPhase
-from simulator import simulate_rlhf_iteration, simulate_stage
-from stages import RLHFTimeline, StageBoundary
-from strategies import (
-    MegatronScheme,
+from operators.llama_resharding import (
     MegatronToMegatronP2P,
     llama_total_parameter_bytes,
 )
+from simulator import simulate_rlhf_iteration, simulate_stage
+from stages import RLHFTimeline, StageBoundary
+from strategies import MegatronScheme
 from topo import Device, HostTopo, Link, Path
 from transition import StageTransition
 from workload_context import (
@@ -54,7 +54,6 @@ SMALL_LLAMA = LlamaConfig(
 A100 = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
-    ridge_flops_per_byte=156.0,
 )
 
 
@@ -166,7 +165,7 @@ def test_rlhf_iteration_sums_stages_and_boundary():
     )
     train_sm = ModelMappingGroup(model_mappings=[train_mm])
     gen_sm = ModelMappingGroup(model_mappings=[gen_mm])
-    transition = StageTransition(source=train_mm, dest=gen_mm, strategy=MegatronToMegatronP2P())
+    transition = StageTransition(source=train_mm, dest=gen_mm, scheme=MegatronToMegatronP2P())
     timeline = RLHFTimeline(
         stages=[[train_sm], [gen_sm]],
         boundaries=[StageBoundary(transitions=[transition])],

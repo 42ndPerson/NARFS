@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Callable, NamedTuple, Optional, Union
 
 from hardware import HardwareSpec
@@ -8,18 +9,56 @@ from operator_base import Operator
 from workload_context import WorkloadContext
 
 
+class OpRole(Enum):
+    """Architecture-agnostic semantic role of a labeled operator.
+
+    Architectures emit `LabeledOp(role, operator)` using this canonical
+    taxonomy; `ParallelismScheme`s map each role to a sharding decoration
+    via their own table. Adding a new architecture means selecting from
+    the existing roles (no scheme changes); adding a new scheme means
+    defining a single role→decoration table that handles every
+    architecture.
+
+    Roles describe *what the op is structurally*, not *how it's sharded*
+    — schemes choose the sharding direction. E.g. `FFN_EXPAND` is
+    column-parallel under Megatron but fully-sharded under FSDP.
+    """
+
+    # Embedding + final projection
+    TOKEN_EMBED = auto()            # vocab id → hidden
+    LM_HEAD = auto()                # final hidden → vocab logits
+    # Residual-stream layer norms
+    NORM = auto()                   # RMSNorm / LayerNorm on residual
+    # Attention block
+    QKV_PROJ = auto()               # hidden → per-head Q/K/V (Llama QKV, MLA q_up/kv_up)
+    LATENT_DOWN_PROJ = auto()       # hidden → compressed latent (MLA q_down, kv_down)
+    ROPE = auto()                   # rotary positional encoding
+    ATTN_HEADS = auto()             # per-head attention compute
+    ATTN_OUT = auto()               # head outputs → hidden (residual)
+    # FFN block (dense path; shared experts collapse here too)
+    FFN_EXPAND = auto()             # hidden → intermediate (gate, up)
+    FFN_ACT = auto()                # SwiGLU / GeLU on intermediate
+    FFN_REDUCE = auto()             # intermediate → hidden (down)
+    # MoE routing + routed experts
+    ROUTER = auto()                 # hidden → expert logits
+    DISPATCH_MARKER = auto()        # zero-compute; carries MoE dispatch all-to-all
+    COMBINE_MARKER = auto()         # zero-compute; carries MoE combine all-to-all
+    ROUTED_EXPERT_EXPAND = auto()   # routed-expert gate / up
+    ROUTED_EXPERT_ACT = auto()      # routed-expert activation
+    ROUTED_EXPERT_REDUCE = auto()   # routed-expert down
+
+
 @dataclass(frozen=True)
 class LabeledOp:
     """An operator emitted by an Architecture's `forward_sequence`, tagged
-    with a semantic label that the Strategy uses to decide sharding and
-    collective emission.
+    with its semantic `OpRole`.
 
-    Labels are the vocabulary between Architecture and Strategy. The
-    architecture emits structural operators with canonical labels (e.g.
-    "qkv", "attn_out", "ffn_down", "lm_head"); the strategy looks them up
-    in its label-to-decision table.
+    The architecture commits to *what the op is* (a hidden→intermediate
+    expansion, an attention output, a routed expert reduction, etc.); the
+    `ParallelismScheme` decides *how to shard it* via a role→decoration
+    table.
     """
-    label: str
+    role: OpRole
     operator: Operator
 
 

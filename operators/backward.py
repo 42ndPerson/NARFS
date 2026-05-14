@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from hardware import HardwareSpec
 from operator_base import Operator
 from operators.pattern import (
     LabeledOp,
@@ -38,10 +37,6 @@ class BackwardOp(Operator):
 
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         return self._memory_scale() * self.forward.memory_bytes(ctx)
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        # Same arithmetic intensity as forward (compute and memory scale together).
-        return self.forward.is_compute_bound(ctx, hw)
 
     def is_small_dim(self, ctx: WorkloadContext) -> bool:
         return self.forward.is_small_dim(ctx)

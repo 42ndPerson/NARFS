@@ -23,12 +23,8 @@ from network_op import (
     Broadcast,
     P2P,
 )
-from network_requirement import (
-    CollectiveKind,
-    NetworkRequirement,
-    ParallelismConfig,
-    ParallelismGroup,
-)
+from network_requirement import CollectiveKind, NetworkRequirement
+from parallelism import ParallelismConfig, ParallelismGroup
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from relation import Relation
@@ -61,7 +57,6 @@ SMALL_LLAMA = LlamaConfig(
 A100 = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
-    ridge_flops_per_byte=156.0,
 )
 
 

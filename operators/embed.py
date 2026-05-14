@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from hardware import HardwareSpec
 from operator_base import Operator
 from workload_context import TokenCount, WorkloadContext
 
@@ -32,10 +31,6 @@ class TokenEmbedding(Operator):
         # Per-token write of an h-vector; the table read is one row per token,
         # negligible vs. the contiguous output write.
         return self._t(ctx) * self.h * self.dtype_bytes
-
-    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
-        del ctx, hw
-        return False
 
     def parameter_bytes(self) -> int:
         return self.vocab * self.h * self.dtype_bytes
