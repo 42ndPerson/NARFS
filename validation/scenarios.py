@@ -102,8 +102,10 @@ class Scenario:
     metric: str = "total"  # or "decode_step"
     spine_bandwidth_gbps: float = 4800.0  # NVLink-class shared spine; tuned per-scenario
 
-    # Topology selector. Default keeps the pessimistic single-spine fabric
-    # for backwards compatibility with the original baseline scenarios.
+    # Topology selector. Defaults to the single-spine fabric, which only the
+    # single-GPU scenarios use (they have no inter-device traffic, so the
+    # fabric model is moot for them); the multi-GPU scenarios pick a
+    # realistic fabric explicitly.
     #   "shared_spine"  — every host pair shares one Link (default).
     #   "nvswitch"      — every host pair has its own dedicated Link
     #                     (full-bisection NVLink/NVSwitch model).
@@ -113,6 +115,35 @@ class Scenario:
     topology_kind: str = "shared_spine"
     hosts_per_node: int = 8
     inter_node_bandwidth_gbps: float = 400.0  # 8x100Gb IB ≈ 400 GB/s
+
+    # Per-GPU NVLink aggregate egress / ingress bandwidth. Set per scenario
+    # to the GPU's full NVLink-port aggregate (A100 ≈ 2400 Gbps, H100 ≈
+    # 3600 Gbps per direction). The topology builders feed this into
+    # `Path`'s `src_device_bandwidth` / `dst_device_bandwidth` so per-GPU
+    # contention shows up: every path leaving a GPU shares one phantom
+    # self-loop `Link`, and concurrent transfers from that GPU divide the
+    # cap. Irrelevant for single-GPU scenarios; the default leaves it at
+    # a generic NVLink-class value.
+    gpu_egress_bandwidth_gbps: float = 4800.0
+
+    # Per-GPU NIC bandwidth, used for the attach links that bridge a GPU
+    # to a shared (int-endpointed) inter-node IB Link. For 400 Gb IB
+    # (DGX-class H100), ~400 Gbps per direction. Note: due to how Path
+    # connectivity is structured, this caps per-(src-GPU, dst-node)
+    # bandwidth rather than per-GPU NIC aggregate across destination
+    # nodes — modeling true per-GPU NIC aggregate would require a
+    # device-self-loop attach at a non-endpoint position, which Path's
+    # current validation disallows.
+    nic_bandwidth_gbps: float = 400.0
+
+    # Per-attach-link latency in ms. Applied to each attach Link bridging
+    # `Device → shared int-endpointed Link → Device` (so the path picks
+    # up twice this value when traversing a cross-node IB path). Models
+    # NIC + PCIe traversal on each end; the IB fabric's own latency
+    # lives on the shared Link itself. Default 0 matches the current
+    # latency-free baseline; raise per scenario to model realistic
+    # small-message costs.
+    nic_latency_ms: float = 0.0
 
 
 # ---- scenario instances -------------------------------------------------------
@@ -158,7 +189,10 @@ SCENARIOS: list[Scenario] = [
     ),
     Scenario(
         name="llama3_70b_prefill_8xa100_tp8",
-        description="Llama-3-70B prefill, batch=1, prompt=2048, 8xA100-80GB TP=8. Reference ~250ms.",
+        description=(
+            "Llama-3-70B prefill, batch=1, prompt=2048, 8xA100-80GB TP=8 on a "
+            "full-bisection NVSwitch fabric. Reference ~250ms."
+        ),
         architecture=LLAMA3_70B,
         model_class=LlamaModel,
         parallelism=ParallelismConfig(tp=8, pp=1, dp=1, ep=1),
@@ -172,13 +206,16 @@ SCENARIOS: list[Scenario] = [
         reference_latency_ms=250.0,
         tolerance_percent=50.0,
         metric="total",
-        spine_bandwidth_gbps=4800.0,  # NVLink-class intra-node
+        spine_bandwidth_gbps=2400.0,  # A100 NVLink: per-pair ~300 GB/s
+        topology_kind="nvswitch",
+        gpu_egress_bandwidth_gbps=2400.0,  # A100 NVLink aggregate egress
     ),
     Scenario(
         name="llama3_8b_training_8xa100_tp2_pp2_dp2",
         description=(
             "Llama-3-8B training step, batch=64, microbatch=4, prompt=2048, "
-            "8xA100-80GB TP=2 PP=2 DP=2. Reference ~3-5s (Megatron-class). Sanity bound."
+            "8xA100-80GB TP=2 PP=2 DP=2 on an NVSwitch fabric. "
+            "Reference ~3-5s (Megatron-class). Sanity bound."
         ),
         architecture=LLAMA3_8B,
         model_class=LlamaModel,
@@ -198,14 +235,21 @@ SCENARIOS: list[Scenario] = [
         reference_latency_ms=4000.0,  # midpoint of 3-5s
         tolerance_percent=100.0,  # explicit "sanity bound, not tight target"
         metric="total",
-        spine_bandwidth_gbps=4800.0,
+        spine_bandwidth_gbps=2400.0,  # A100 NVLink: per-pair ~300 GB/s
+        topology_kind="nvswitch",
+        gpu_egress_bandwidth_gbps=2400.0,  # A100 NVLink aggregate egress
     ),
     Scenario(
-        name="deepseek_v3_prefill_32xh100_ep32",
-        description="DeepSeek-V3 prefill, batch=1, prompt=4096, 32xH100-80GB EP=32 TP=1 PP=1. Reference ~500ms (looser bound).",
+        name="deepseek_v3_prefill_32xh100_ep8_tp4",
+        description=(
+            "DeepSeek-V3 prefill, batch=1, prompt=4096, 32xH100-80GB EP=8 TP=4 "
+            "PP=1 across 4 nodes × 8 GPUs: NVSwitch within node, IB between. "
+            "TP shards attention 4-way (a TP group stays intra-node); EP=8 "
+            "spans nodes. Reference ~500ms (looser bound)."
+        ),
         architecture=DEEPSEEK_V3,
         model_class=V3Model,
-        parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=32),
+        parallelism=ParallelismConfig(tp=4, pp=1, dp=1, ep=8),
         hardware=H100_80GB,
         workload=Workload.PREPARATION,
         workload_ctx=WorkloadContext(
@@ -216,89 +260,14 @@ SCENARIOS: list[Scenario] = [
         reference_latency_ms=500.0,
         tolerance_percent=100.0,  # V3 numbers are less stable
         metric="total",
-        spine_bandwidth_gbps=7200.0,  # H100 NVLink-class
-    ),
-
-    # ---- Realistic-topology variants ------------------------------------------
-    # Same architecture / parallelism / reference numbers as the contention-
-    # bound baseline scenarios above, but using the NVSwitch / multi-node
-    # topology builders. These are the variants worth comparing — the
-    # single-host scenarios (no inter-host traffic) wouldn't differ.
-
-    Scenario(
-        name="llama3_70b_prefill_8xa100_tp8_nvswitch",
-        description=(
-            "Llama-3-70B prefill, batch=1, prompt=2048, 8xA100-80GB TP=8 on a "
-            "full-bisection NVSwitch fabric (each GPU pair has its own private "
-            "lane). Reference ~250ms."
-        ),
-        architecture=LLAMA3_70B,
-        model_class=LlamaModel,
-        parallelism=ParallelismConfig(tp=8, pp=1, dp=1, ep=1),
-        hardware=A100_80GB,
-        workload=Workload.PREPARATION,
-        workload_ctx=WorkloadContext(
-            workload_type=Workload.PREPARATION,
-            batch_size=1, microbatch_size=1,
-            prompt_len=2048, response_len=0, num_microbatches=1,
-        ),
-        reference_latency_ms=250.0,
-        tolerance_percent=50.0,
-        metric="total",
-        # A100 NVLink: per-pair ~300 GB/s ≈ 2400 Gbps.
-        spine_bandwidth_gbps=2400.0,
-        topology_kind="nvswitch",
-    ),
-    Scenario(
-        name="llama3_8b_training_8xa100_tp2_pp2_dp2_nvswitch",
-        description=(
-            "Llama-3-8B training step on 8xA100 with NVSwitch (per-pair "
-            "private lanes). batch=64, microbatch=4, prompt=2048, "
-            "TP=2 PP=2 DP=2. Reference ~3-5s sanity bound."
-        ),
-        architecture=LLAMA3_8B,
-        model_class=LlamaModel,
-        parallelism=ParallelismConfig(tp=2, pp=2, dp=2, ep=1),
-        hardware=A100_80GB,
-        workload=Workload.TRAINING,
-        workload_ctx=WorkloadContext(
-            workload_type=Workload.TRAINING,
-            batch_size=32, microbatch_size=4,
-            prompt_len=2048, response_len=0, num_microbatches=8,
-        ),
-        reference_latency_ms=4000.0,
-        tolerance_percent=100.0,
-        metric="total",
-        spine_bandwidth_gbps=2400.0,
-        topology_kind="nvswitch",
-    ),
-    Scenario(
-        name="deepseek_v3_prefill_32xh100_ep32_multinode",
-        description=(
-            "DeepSeek-V3 prefill, batch=1, prompt=4096, 32xH100-80GB EP=32 "
-            "across 4 nodes × 8 GPUs each: NVSwitch within node, IB between. "
-            "Reference ~500ms (looser bound)."
-        ),
-        architecture=DEEPSEEK_V3,
-        model_class=V3Model,
-        parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=32),
-        hardware=H100_80GB,
-        workload=Workload.PREPARATION,
-        workload_ctx=WorkloadContext(
-            workload_type=Workload.PREPARATION,
-            batch_size=1, microbatch_size=1,
-            prompt_len=4096, response_len=0, num_microbatches=1,
-        ),
-        reference_latency_ms=500.0,
-        tolerance_percent=100.0,
-        metric="total",
-        # H100 NVLink: per-pair ~450 GB/s ≈ 3600 Gbps.
+        # H100 NVLink: per-pair ~450 GB/s ≈ 3600 Gbps (intra-node).
         spine_bandwidth_gbps=3600.0,
         topology_kind="multinode",
         hosts_per_node=8,
         # 8x400Gb IB per node ≈ 400 GB/s shared across the (node_a, node_b)
-        # pair, then divided by the (intra_node) × (intra_node) = 64
-        # cross-node connections through the same IB pool.
+        # pair, then divided by the cross-node connections through the same
+        # IB pool.
         inter_node_bandwidth_gbps=400.0 * 8,  # 8 lanes per direction
+        gpu_egress_bandwidth_gbps=3600.0,  # H100 NVLink aggregate egress
     ),
 ]

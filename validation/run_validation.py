@@ -41,32 +41,78 @@ def _dev(host: int) -> Device:
     return Device(host_id=host, gpu_id=0)
 
 
-def _path_through_link(src: Device, dst: Device, shared: Link) -> TopoPath:
-    """Path from src to dst going through `shared`, with 0-latency
-    huge-bandwidth attach links so the shared link drives contention.
+def _path_through_link(
+    src: Device, dst: Device, shared: Link,
+    device_bandwidth_gbps: float,
+    attach_bandwidth_gbps: float,
+    attach_latency_ms: float = 0.0,
+) -> TopoPath:
+    """Path from src to dst through `shared`. Per-GPU egress and ingress
+    are capped at `device_bandwidth_gbps` via `Path`'s phantom self-loop
+    mechanism — every path from a given GPU shares one phantom `Link`
+    (value-keyed on `(device, cap)`), so concurrent transfers from that
+    GPU divide the cap correctly.
+
+    Attach links bridge `Device → shared.node_a_id → ... → shared.node_b_id
+    → Device` and represent real physical components — the per-GPU NIC
+    + PCIe in the cross-node IB case — so they take real bandwidth
+    (`attach_bandwidth_gbps`) and latency (`attach_latency_ms`) rather
+    than placeholder huge/zero.
+
+    Casing — each attach is added only when `shared`'s corresponding
+    endpoint is *not* already a `Device`. When `shared.node_a_id == src`
+    (per-pair fabric link, `Device`-endpointed on the source side), the
+    attach that would otherwise be constructed collapses to
+    `Link(src, src, ...)` — a self-loop already provided by the `Path`
+    phantom inserted via `src_device_bandwidth`. Skipping it avoids
+    that redundant self-loop. Same logic on the destination side.
     """
-    huge = 1e9
-    attach_src = Link(node_a_id=src, node_b_id=shared.node_a_id, bandwidth=huge, latency=0.0)
-    attach_dst = Link(node_a_id=shared.node_b_id, node_b_id=dst, bandwidth=huge, latency=0.0)
-    return TopoPath([attach_src, shared, attach_dst])
+    links: list[Link] = []
+    if not isinstance(shared.node_a_id, Device):
+        links.append(Link(
+            node_a_id=src, node_b_id=shared.node_a_id,
+            bandwidth=attach_bandwidth_gbps, latency=attach_latency_ms,
+        ))
+    links.append(shared)
+    if not isinstance(shared.node_b_id, Device):
+        links.append(Link(
+            node_a_id=shared.node_b_id, node_b_id=dst,
+            bandwidth=attach_bandwidth_gbps, latency=attach_latency_ms,
+        ))
+    return TopoPath(
+        links,
+        src_device_bandwidth=device_bandwidth_gbps,
+        dst_device_bandwidth=device_bandwidth_gbps,
+    )
 
 
 # ---- topology + mapping helpers ---------------------------------------------
 
 
-def build_topology(num_hosts: int, spine_bandwidth_gbps: float) -> HostTopo:
+def build_topology(
+    num_hosts: int,
+    spine_bandwidth_gbps: float,
+    device_egress_gbps: float,
+    attach_bandwidth_gbps: float,
+    attach_latency_ms: float = 0.0,
+) -> HostTopo:
     """Single shared spine link between every device pair.
 
     Pessimistic baseline: ALL device pairs share one Link instance, so every
     inter-device transfer in the cluster contends on the same logical pipe.
     This bounds the worst case for cross-device collective contention but
-    over-prices it on real NVLink/NVSwitch fabrics.
+    over-prices it on real NVLink/NVSwitch fabrics. Per-GPU egress/ingress
+    is capped at `device_egress_gbps` via Path phantoms; the attach links
+    bridging Device→spine→Device take `attach_bandwidth_gbps`.
     """
     if num_hosts <= 1:
         return HostTopo(device_connections={})
     spine = Link(node_a_id=-1, node_b_id=-2, bandwidth=spine_bandwidth_gbps, latency=0.0)
     connections = {
-        (_dev(i), _dev(j)): _path_through_link(_dev(i), _dev(j), spine)
+        (_dev(i), _dev(j)): _path_through_link(
+            _dev(i), _dev(j), spine,
+            device_egress_gbps, attach_bandwidth_gbps, attach_latency_ms,
+        )
         for i in range(num_hosts)
         for j in range(num_hosts)
         if i != j
@@ -75,17 +121,23 @@ def build_topology(num_hosts: int, spine_bandwidth_gbps: float) -> HostTopo:
 
 
 def build_nvswitch_topology(
-    num_hosts: int, link_bandwidth_gbps: float
+    num_hosts: int,
+    link_bandwidth_gbps: float,
+    device_egress_gbps: float,
+    attach_bandwidth_gbps: float,
+    attach_latency_ms: float = 0.0,
 ) -> HostTopo:
     """Full-bisection NVSwitch model: every ordered device pair gets its own
-    dedicated `Link` at NVLink-class bandwidth.
+    dedicated `Link` at NVLink-class bandwidth, and each GPU's NVLink
+    aggregate egress/ingress is capped at `device_egress_gbps`.
 
-    `link_loads` in `topo.HostTopo` is keyed by Link *object identity*
-    (frozen-dataclass hash), so distinct Link instances don't contend with
-    each other. This matches a real single-node NVSwitch fabric where each
-    GPU pair has a private full-bandwidth lane: an 8-rank ring AllReduce
-    running at NVLink-class speeds doesn't bottleneck on a shared spine.
+    Pair links are `Device`-endpointed, so `_path_through_link` skips
+    constructing attach links for them (they'd collapse to redundant
+    self-loops alongside the phantom). The `attach_bandwidth_gbps` /
+    `attach_latency_ms` parameters are accepted for API uniformity but
+    are unused in this builder.
     """
+    del attach_bandwidth_gbps, attach_latency_ms
     if num_hosts <= 1:
         return HostTopo(device_connections={})
     connections: dict[tuple[Device, Device], TopoPath] = {}
@@ -94,10 +146,15 @@ def build_nvswitch_topology(
             if i == j:
                 continue
             link = Link(
-                node_a_id=i, node_b_id=j,
+                node_a_id=_dev(i), node_b_id=_dev(j),
                 bandwidth=link_bandwidth_gbps, latency=0.0,
             )
-            connections[(_dev(i), _dev(j))] = _path_through_link(_dev(i), _dev(j), link)
+            # `_path_through_link` will skip both attach links because
+            # `link` is Device-endpointed; placeholders ok.
+            connections[(_dev(i), _dev(j))] = _path_through_link(
+                _dev(i), _dev(j), link,
+                device_egress_gbps, device_egress_gbps,
+            )
     return HostTopo(device_connections=connections)
 
 
@@ -106,15 +163,24 @@ def build_multinode_topology(
     hosts_per_node: int,
     intra_node_bandwidth_gbps: float,
     inter_node_bandwidth_gbps: float,
+    device_egress_gbps: float,
+    attach_bandwidth_gbps: float,
+    attach_latency_ms: float = 0.0,
 ) -> HostTopo:
-    """Multi-node fat-tree-ish: NVSwitch within a node, IB between nodes.
+    """Multi-node fat-tree-ish: NVSwitch within a node, IB between nodes,
+    with per-GPU egress/ingress capped at `device_egress_gbps`.
 
-    Within-node pairs each get a private full-bandwidth Link (NVSwitch).
-    Cross-node pairs (node_a ≠ node_b) share one Link per directed
-    (node_a, node_b) pair — every GPU on node_a talking to every GPU on
-    node_b contends on the same inter-node IB link. This is conservative
-    versus a true rail-aligned fat tree but materially better than the
-    single-spine pessimistic baseline.
+    Within-node pairs use `Device`-endpointed per-pair Links (NVSwitch);
+    `_path_through_link` skips attach links for them because they'd
+    collapse to redundant self-loops alongside the phantom. Cross-node
+    pairs share one int-endpointed Link per directed (node_a, node_b)
+    pair — every GPU on node_a talking to every GPU on node_b contends
+    on the same inter-node IB link — and `_path_through_link` *does*
+    add attach links to bridge `Device → int → Device`. Those attach
+    links carry `attach_bandwidth_gbps` (per-GPU NIC) and
+    `attach_latency_ms` (per-end NIC+PCIe latency), so the NIC shows up
+    as a real bottleneck distinct from both the NVLink phantom and the
+    shared IB pool.
     """
     if num_hosts <= 1:
         return HostTopo(device_connections={})
@@ -134,13 +200,14 @@ def build_multinode_topology(
                 continue
             ni, nj = _node_of(i), _node_of(j)
             if ni == nj:
-                # Intra-node: private NVSwitch lane per pair.
+                # Intra-node: per-pair Device-endpointed link (NVSwitch).
                 link = Link(
-                    node_a_id=i, node_b_id=j,
+                    node_a_id=_dev(i), node_b_id=_dev(j),
                     bandwidth=intra_node_bandwidth_gbps, latency=0.0,
                 )
             else:
-                # Inter-node: shared IB link per (node, node) pair.
+                # Inter-node: shared IB link per (node, node) pair, int-
+                # endpointed so multiple paths hash-equal on the same Link.
                 key = (ni, nj)
                 link = inter_node_links.get(key)
                 if link is None:
@@ -150,7 +217,10 @@ def build_multinode_topology(
                         bandwidth=inter_node_bandwidth_gbps, latency=0.0,
                     )
                     inter_node_links[key] = link
-            connections[(_dev(i), _dev(j))] = _path_through_link(_dev(i), _dev(j), link)
+            connections[(_dev(i), _dev(j))] = _path_through_link(
+                _dev(i), _dev(j), link,
+                device_egress_gbps, attach_bandwidth_gbps, attach_latency_ms,
+            )
     return HostTopo(device_connections=connections)
 
 
@@ -192,16 +262,28 @@ def build_model_mapping(scenario: Scenario) -> tuple[ModelMapping, HostTopo]:
 def _topology_for_scenario(scenario: Scenario, num_hosts: int) -> HostTopo:
     """Dispatch on `scenario.topology_kind`. Defaults to shared-spine."""
     kind = scenario.topology_kind
+    device_egress = scenario.gpu_egress_bandwidth_gbps
+    attach_bw = scenario.nic_bandwidth_gbps
+    attach_lat = scenario.nic_latency_ms
     if kind == "shared_spine":
-        return build_topology(num_hosts, scenario.spine_bandwidth_gbps)
+        return build_topology(
+            num_hosts, scenario.spine_bandwidth_gbps,
+            device_egress, attach_bw, attach_lat,
+        )
     if kind == "nvswitch":
-        return build_nvswitch_topology(num_hosts, scenario.spine_bandwidth_gbps)
+        return build_nvswitch_topology(
+            num_hosts, scenario.spine_bandwidth_gbps,
+            device_egress, attach_bw, attach_lat,
+        )
     if kind == "multinode":
         return build_multinode_topology(
             num_hosts,
             hosts_per_node=scenario.hosts_per_node,
             intra_node_bandwidth_gbps=scenario.spine_bandwidth_gbps,
             inter_node_bandwidth_gbps=scenario.inter_node_bandwidth_gbps,
+            device_egress_gbps=device_egress,
+            attach_bandwidth_gbps=attach_bw,
+            attach_latency_ms=attach_lat,
         )
     raise ValueError(f"{scenario.name}: unknown topology_kind {kind!r}")
 
