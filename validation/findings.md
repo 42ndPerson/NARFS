@@ -1,4 +1,4 @@
-# Simulator validation findings — 2026-05-18T10:12:06Z
+# Simulator validation findings — 2026-05-18T10:20:34Z
 
 Generated automatically by `run_validation.py` whenever any scenario is more than 30% off its published reference. Default tolerance is 50%; training and DeepSeek-V3 are tagged as sanity bounds (100%).
 
@@ -9,7 +9,7 @@ Generated automatically by `run_validation.py` whenever any scenario is more tha
 | llama2_7b_prefill_a100 | 57.6 ms | 50.0 ms | +15.2% | 50% | ✓ |
 | llama2_7b_decode_a100 | 10.3 ms | 25.0 ms | -58.6% | 50% | ✗ |
 | llama3_70b_prefill_8xa100_tp8 | 258.2 ms | 250.0 ms | +3.3% | 50% | ✓ |
-| llama3_8b_training_8xa100_tp2_pp2_dp2 | 9538.0 ms | 4000.0 ms | +138.4% | 100% | ✗ |
+| llama3_8b_training_8xa100_tp2_pp2_dp2 | 9487.0 ms | 4000.0 ms | +137.2% | 100% | ✗ |
 | deepseek_v3_prefill_32xh100_ep8_tp4 | 614.9 ms | 500.0 ms | +23.0% | 100% | ✓ |
 
 ## Per-scenario investigation
@@ -37,7 +37,7 @@ Pure roofline + GEMV efficiency tier (0.3 compute / 0.65 memory for M<16 GEMMs) 
 
 _Llama-3-8B training step, batch=64, microbatch=4, prompt=2048, 8xA100-80GB TP=2 PP=2 DP=2 on an NVSwitch fabric. Reference ~3-5s (Megatron-class). Sanity bound._
 
-- **Predicted:** 9538.0 ms  **Reference:** 4000.0 ms  **Error:** +138.4%  **Tolerance:** ±100% (exceeds tolerance)
+- **Predicted:** 9487.0 ms  **Reference:** 4000.0 ms  **Error:** +137.2%  **Tolerance:** ±100% (exceeds tolerance)
 
 **Dominant operators by wall-time fraction:**
 

@@ -89,10 +89,19 @@ class ModelMappingGroup:
 
     @property
     def network_composition(self) -> NetworkComposition:
-        """The MMG's network composition: a `Sequential` over its member
-        MMs' compositions (MMs within an MMG run one after another).
-        Stage-level composition wraps these in a `Parallel`."""
+        """The MMG's steady-state network composition: a `Sequential`
+        over its member MMs' steady compositions (MMs within an MMG run
+        one after another). Stage-level wraps these in a `Parallel`."""
         return Sequential([mm.network_composition for mm in self.model_mappings])
+
+    @property
+    def network_composition_fill_drain(self) -> NetworkComposition:
+        """The MMG's fill/drain network composition — each member MM
+        contributes its own fill/drain composition (one PP stage active
+        at a time for PP MMs; identical to steady for pp=1)."""
+        return Sequential([
+            mm.network_composition_fill_drain for mm in self.model_mappings
+        ])
 
     def simulate_isolated(
         self,
@@ -108,10 +117,14 @@ class ModelMappingGroup:
         """
         op_transfers = resolve_op_transfers(workload_ctx, self.model_mappings)
         steady_times = steady_transfer_times(self.network_composition, op_transfers, topo)
+        fill_drain_times = steady_transfer_times(
+            self.network_composition_fill_drain, op_transfers, topo,
+        )
         boundary_times = boundary_transfer_times(op_transfers, topo)
         return sum(
             mm.simulate(
                 workload_ctx, hw, op_transfers, steady_times, boundary_times,
+                transfer_times_fill_drain=fill_drain_times,
             ).total_time
             for mm in self.model_mappings
         )

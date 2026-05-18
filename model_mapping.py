@@ -178,10 +178,22 @@ class ModelMapping:
     # one full forward pass when pp=1). Built from forward_seq +
     # pipeline_partition + pp_p2p_op_*. Consumed by `ContentionModel` at
     # the stage level (composed up through MMG and stage `Parallel`).
+    #
+    # Two snapshots: `network_composition` for steady state (all PP
+    # stages concurrent); `network_composition_fill_drain` for the fill
+    # and drain phases (only one stage active at a time, modeled by
+    # wrapping per-stage Sequentials in an outer `Sequential` rather
+    # than the steady `Parallel`). For pp=1 the two are identical.
     network_composition: NetworkComposition = field(
         init=False, default_factory=Sequential,
     )
+    network_composition_fill_drain: NetworkComposition = field(
+        init=False, default_factory=Sequential,
+    )
     decode_network_composition: NetworkComposition = field(
+        init=False, default_factory=Sequential,
+    )
+    decode_network_composition_fill_drain: NetworkComposition = field(
         init=False, default_factory=Sequential,
     )
     # PP activation P2P NetworkOps. Forward fires every microbatch transition;
@@ -213,9 +225,17 @@ class ModelMapping:
             self.network_composition = self._build_network_composition(
                 self.forward_seq, self.pipeline_partition,
             )
+            self.network_composition_fill_drain = self._build_network_composition_fill_drain(
+                self.forward_seq, self.pipeline_partition,
+            )
             if self.workload is Workload.GENERATION:
                 self.decode_network_composition = self._build_network_composition(
                     self.decode_seq, self.decode_pipeline_partition,
+                )
+                self.decode_network_composition_fill_drain = (
+                    self._build_network_composition_fill_drain(
+                        self.decode_seq, self.decode_pipeline_partition,
+                    )
                 )
 
     # ----- legacy property surface -------------------------------------------
@@ -315,17 +335,47 @@ class ModelMapping:
 
     # ----- network composition (for ContentionModel) -------------------------
 
+    @staticmethod
+    def _co_to_composition(co: CombinedOp) -> NetworkComposition:
+        if not co.network_ops:
+            return Empty(1)
+        if len(co.network_ops) == 1:
+            return NetworkLeaf(co.network_ops[0])
+        # Multiple ops at one position genuinely co-occur.
+        return Parallel([NetworkLeaf(op) for op in co.network_ops])
+
+    def _stage_to_composition(
+        self,
+        seq: list[CombinedOp],
+        indices: list[int],
+    ) -> NetworkComposition:
+        """One PP stage's sequential network composition (or the whole
+        forward seq when pp=1). Compute-only runs collapse into Empty(N)."""
+        children: list[NetworkComposition] = []
+        empty_run = 0
+        for i in indices:
+            comp = self._co_to_composition(seq[i])
+            if isinstance(comp, Empty):
+                empty_run += comp.length
+            else:
+                if empty_run > 0:
+                    children.append(Empty(empty_run))
+                    empty_run = 0
+                children.append(comp)
+        if empty_run > 0:
+            children.append(Empty(empty_run))
+        return Sequential(children)
+
     def _build_network_composition(
         self,
         seq: list[CombinedOp],
         partition: list[list[int]],
     ) -> NetworkComposition:
-        """One pipeline slot's worth of network activity (or one full
-        forward pass when pp=1).
+        """Steady-state composition: one pipeline slot's worth of network
+        activity (or one full forward pass when pp=1).
 
         pp=1 → Sequential over every CombinedOp position: a NetworkLeaf
-        per collective, Empty for compute-only positions. Consecutive
-        empties collapse into one Empty(N).
+        per collective, Empty for compute-only positions.
 
         pp>1 → Parallel over per-stage Sequentials plus the PP-P2P
         leaves. At pipeline steady state every stage is processing some
@@ -334,38 +384,49 @@ class ModelMapping:
         """
         if not seq:
             return Sequential([])
-
-        def _co_composition(co: CombinedOp) -> NetworkComposition:
-            if not co.network_ops:
-                return Empty(1)
-            if len(co.network_ops) == 1:
-                return NetworkLeaf(co.network_ops[0])
-            # Multiple ops at one position genuinely co-occur.
-            return Parallel([NetworkLeaf(op) for op in co.network_ops])
-
-        def _stage_composition(indices: list[int]) -> NetworkComposition:
-            children: list[NetworkComposition] = []
-            empty_run = 0
-            for i in indices:
-                comp = _co_composition(seq[i])
-                if isinstance(comp, Empty):
-                    empty_run += comp.length
-                else:
-                    if empty_run > 0:
-                        children.append(Empty(empty_run))
-                        empty_run = 0
-                    children.append(comp)
-            if empty_run > 0:
-                children.append(Empty(empty_run))
-            return Sequential(children)
-
         if self.parallelism.pp <= 1:
-            return _stage_composition(list(range(len(seq))))
+            return self._stage_to_composition(seq, list(range(len(seq))))
 
-        stage_compositions: list[NetworkComposition] = [
-            _stage_composition(indices) for indices in partition if indices
+        stage_compositions = [
+            self._stage_to_composition(seq, indices)
+            for indices in partition if indices
         ]
         parallel_children: list[NetworkComposition] = list(stage_compositions)
+        if self.pp_p2p_op_forward is not None:
+            parallel_children.append(NetworkLeaf(self.pp_p2p_op_forward))
+        if self.pp_p2p_op_backward is not None:
+            parallel_children.append(NetworkLeaf(self.pp_p2p_op_backward))
+        return Parallel(parallel_children)
+
+    def _build_network_composition_fill_drain(
+        self,
+        seq: list[CombinedOp],
+        partition: list[list[int]],
+    ) -> NetworkComposition:
+        """Fill/drain composition: only one PP stage active at a time.
+
+        Identical to the steady composition for pp=1 (no fill/drain phase).
+        For pp>1, the per-stage Sequentials are wrapped in an outer
+        `Sequential` instead of `Parallel`, so each stage's ops see no
+        background from other stages — modeling the fill/drain phase
+        where the pipeline isn't fully loaded. P2P remains a `Parallel`
+        sibling (it fires every slot).
+
+        This is the simpler bound of "one stage active." The weighted
+        aggregator combines per-op times from this snapshot with the
+        steady snapshot, weighted by slot count
+        (`fill_drain_slots = 2(pp − 1)`, `steady_slots = nmb − pp + 1`).
+        """
+        if not seq:
+            return Sequential([])
+        if self.parallelism.pp <= 1:
+            return self._stage_to_composition(seq, list(range(len(seq))))
+
+        stage_compositions = [
+            self._stage_to_composition(seq, indices)
+            for indices in partition if indices
+        ]
+        parallel_children: list[NetworkComposition] = [Sequential(stage_compositions)]
         if self.pp_p2p_op_forward is not None:
             parallel_children.append(NetworkLeaf(self.pp_p2p_op_forward))
         if self.pp_p2p_op_backward is not None:
@@ -576,18 +637,27 @@ class ModelMapping:
         op_transfers: dict[NetworkOp, list[LogicalTransfer]],
         transfer_times_steady: dict[LogicalTransfer, float],
         transfer_times_boundary: dict[LogicalTransfer, float],
+        transfer_times_fill_drain: Optional[dict[LogicalTransfer, float]] = None,
     ) -> SimulationResult:
+        """Per-MM simulation. When `transfer_times_fill_drain` is provided
+        (and the MM is PP), the bubble formula uses weighted two-snapshot
+        contention: `steady_slots × max_stage_steady` for the steady
+        portion plus `fill_drain_slots × max_stage_fill_drain` for the
+        fill+drain portion. When `None`, the steady snapshot is used for
+        all slots (legacy single-snapshot behavior)."""
         if self.workload is Workload.GENERATION:
             prefill = self._simulate_seq(
                 self.forward_seq, self.pipeline_partition,
                 workload_ctx, hw,
                 op_transfers, transfer_times_steady, transfer_times_boundary,
+                transfer_times_fill_drain=transfer_times_fill_drain,
                 pipelined=True,
             )
             decode_step = self._simulate_seq(
                 self.decode_seq, self.decode_pipeline_partition,
                 workload_ctx, hw,
                 op_transfers, transfer_times_steady, transfer_times_boundary,
+                transfer_times_fill_drain=transfer_times_fill_drain,
                 pipelined=False,
             )
             decode_time = decode_step.total_time * max(workload_ctx.response_len, 0)
@@ -606,6 +676,7 @@ class ModelMapping:
             self.forward_seq, self.pipeline_partition,
             workload_ctx, hw,
             op_transfers, transfer_times_steady, transfer_times_boundary,
+            transfer_times_fill_drain=transfer_times_fill_drain,
             pipelined=True,
         )
         if self.workload is Workload.TRAINING:
@@ -627,50 +698,91 @@ class ModelMapping:
         transfer_times_steady: dict[LogicalTransfer, float],
         transfer_times_boundary: dict[LogicalTransfer, float],
         pipelined: bool,
+        transfer_times_fill_drain: Optional[dict[LogicalTransfer, float]] = None,
     ) -> SimulationResult:
-        """Walk `seq` via `ComputeModel` and aggregate with a
-        partition/bubble-aware closure. The walk is parallelism-oblivious;
-        the closure owns the PP math."""
+        """Walk `seq` via `ComputeModel` (once per provided snapshot) and
+        aggregate with a partition/bubble-aware closure. The walk is
+        parallelism-oblivious; the closure owns the PP math.
+
+        When `transfer_times_fill_drain` is provided AND the MM is PP, the
+        bubble formula uses the weighted two-snapshot form:
+
+            total = steady_slots × (max_stage_steady + p2p_steady)
+                  + fill_drain_slots × (max_stage_fill_drain + p2p_fill_drain)
+
+        where `steady_slots = max(0, nmb − pp + 1)` and
+        `fill_drain_slots = 2 × (pp − 1)`. Each snapshot drives both its
+        own per-op times and its own P2P time.
+
+        When `transfer_times_fill_drain` is None (or pp ≤ 1), the steady
+        snapshot is used for all slots (legacy single-snapshot behavior).
+        """
         if not seq:
             return SimulationResult(total_time=0.0, pp_stage_times=[0.0])
 
         pp = self.parallelism.pp
         nmb = max(workload_ctx.num_microbatches, 1)
         is_pipelined = pipelined and pp > 1
+        use_two_snapshot = transfer_times_fill_drain is not None and pp > 1
 
-        # Per-slot PP-P2P time, sized against the steady contention snapshot.
-        # Included in both pipelined and unpipelined PP paths (decode under PP
-        # still pays (pp-1)*p2p_per_mb per token; previously this was missed).
-        p2p_per_mb = 0.0
-        if pp > 1:
+        # Per-slot PP-P2P time, sized against a given steady-class snapshot.
+        def _p2p_under(transfer_times: dict[LogicalTransfer, float]) -> float:
+            p2p = 0.0
             if self.pp_p2p_op_forward is not None:
                 transfers = op_transfers.get(self.pp_p2p_op_forward, [])
-                p2p_per_mb += self.pp_p2p_op_forward.get_operator_time(
-                    transfers, transfer_times_steady,
+                p2p += self.pp_p2p_op_forward.get_operator_time(
+                    transfers, transfer_times,
                 )
             if self.pp_p2p_op_backward is not None:
                 transfers = op_transfers.get(self.pp_p2p_op_backward, [])
-                p2p_per_mb += self.pp_p2p_op_backward.get_operator_time(
-                    transfers, transfer_times_steady,
+                p2p += self.pp_p2p_op_backward.get_operator_time(
+                    transfers, transfer_times,
                 )
+            return p2p
 
-        def aggregate(per_op: list[float]) -> float:
-            stage_times = [sum(per_op[i] for i in stage) for stage in partition]
+        p2p_steady = _p2p_under(transfer_times_steady) if pp > 1 else 0.0
+        if use_two_snapshot and transfer_times_fill_drain is not None:
+            p2p_fill_drain = _p2p_under(transfer_times_fill_drain)
+        else:
+            p2p_fill_drain = p2p_steady
+
+        def aggregate(per_op_per_snap: dict[str, list[float]]) -> float:
+            per_op_steady = per_op_per_snap["steady"]
+            stage_times_steady = [
+                sum(per_op_steady[i] for i in stage) for stage in partition
+            ]
             if is_pipelined:
-                max_stage = max(stage_times)
-                return (nmb + pp - 1) * (max_stage + p2p_per_mb)
+                max_stage_steady = max(stage_times_steady)
+                if use_two_snapshot:
+                    per_op_fd = per_op_per_snap["fill_drain"]
+                    stage_times_fd = [
+                        sum(per_op_fd[i] for i in stage) for stage in partition
+                    ]
+                    max_stage_fd = max(stage_times_fd)
+                    steady_slots = max(0, nmb - pp + 1)
+                    fill_drain_slots = 2 * (pp - 1)
+                    return (
+                        steady_slots * (max_stage_steady + p2p_steady)
+                        + fill_drain_slots * (max_stage_fd + p2p_fill_drain)
+                    )
+                return (nmb + pp - 1) * (max_stage_steady + p2p_steady)
             # Unpipelined: stages run one after another per invocation.
             # Under PP this includes (pp-1) hand-offs per pass.
-            return sum(stage_times) + (pp - 1) * p2p_per_mb
+            return sum(stage_times_steady) + (pp - 1) * p2p_steady
+
+        snapshots: dict[str, dict[LogicalTransfer, float]] = {"steady": transfer_times_steady}
+        if use_two_snapshot:
+            snapshots["fill_drain"] = transfer_times_fill_drain  # type: ignore[assignment]
 
         cm = ComputeModel(seq=seq, aggregate_fn=aggregate)
-        total, per_op = cm.evaluate(
+        total, per_op_per_snap = cm.evaluate(
             workload_ctx, hw,
-            op_transfers, transfer_times_steady, transfer_times_boundary,
+            op_transfers, snapshots, transfer_times_boundary,
         )
-        stage_times = [sum(per_op[i] for i in stage) for stage in partition]
+        per_op_steady = per_op_per_snap["steady"]
+        stage_times = [sum(per_op_steady[i] for i in stage) for stage in partition]
         return SimulationResult(
             total_time=total,
             pp_stage_times=stage_times,
-            per_op_breakdown=per_op,
+            per_op_breakdown=per_op_steady,
         )

@@ -16,9 +16,15 @@ from workload_context import WorkloadContext
 
 
 def _stage_composition(stage: list[ModelMappingGroup]) -> Parallel:
-    """Stage-level composition: `Parallel` over the stage's MMGs (they run
-    concurrently). Each MMG is itself a `Sequential` of its MMs."""
+    """Stage-level steady composition: `Parallel` over the stage's MMGs
+    (they run concurrently). Each MMG is itself a `Sequential` of its MMs."""
     return Parallel([g.network_composition for g in stage])
+
+
+def _stage_composition_fill_drain(stage: list[ModelMappingGroup]) -> Parallel:
+    """Stage-level fill/drain composition: each MMG contributes its
+    fill/drain composition (PP stages sequentialized inside each MM)."""
+    return Parallel([g.network_composition_fill_drain for g in stage])
 
 
 @dataclass
@@ -50,8 +56,10 @@ def simulate_stage(
 
     all_mappings = [mm for g in stage for mm in g.model_mappings]
     op_transfers = resolve_op_transfers(workload_ctx, all_mappings)
-    stage_comp = _stage_composition(stage)
-    steady_times = steady_transfer_times(stage_comp, op_transfers, topo)
+    steady_times = steady_transfer_times(_stage_composition(stage), op_transfers, topo)
+    fill_drain_times = steady_transfer_times(
+        _stage_composition_fill_drain(stage), op_transfers, topo,
+    )
     boundary_times = boundary_transfer_times(op_transfers, topo)
 
     group_times: list[float] = []
@@ -59,6 +67,7 @@ def simulate_stage(
         g_time = sum(
             mm.simulate(
                 workload_ctx, hw, op_transfers, steady_times, boundary_times,
+                transfer_times_fill_drain=fill_drain_times,
             ).total_time
             for mm in g.model_mappings
         )
@@ -84,8 +93,12 @@ def simulate_rlhf_iteration(
         else:
             all_mappings = [mm for g in stage for mm in g.model_mappings]
             op_transfers = resolve_op_transfers(workload_ctx, all_mappings)
-            stage_comp = _stage_composition(stage)
-            steady_times = steady_transfer_times(stage_comp, op_transfers, topo)
+            steady_times = steady_transfer_times(
+                _stage_composition(stage), op_transfers, topo,
+            )
+            fill_drain_times = steady_transfer_times(
+                _stage_composition_fill_drain(stage), op_transfers, topo,
+            )
             boundary_times = boundary_transfer_times(op_transfers, topo)
 
             group_times: list[float] = []
@@ -94,6 +107,7 @@ def simulate_rlhf_iteration(
                 for mm in g.model_mappings:
                     sim = mm.simulate(
                         workload_ctx, hw, op_transfers, steady_times, boundary_times,
+                        transfer_times_fill_drain=fill_drain_times,
                     )
                     per_mm_results.append(sim)
                     g_time += sim.total_time
