@@ -277,14 +277,19 @@ class ParallelismScheme(ABC):
         topology: Optional[HostTopo] = None,
         name: str = "",
         role: str = "",
+        recompute: bool = False,
     ) -> ModelMapping:
         """Convenience facade: build a Plan and assemble it with the given
         placement. Defaults to `canonical_megatron_placement` for backwards
         compatibility with pre-split callers.
+
+        `recompute` (TRAINING only): True → BackwardOp = 3× forward
+        (full activation recomputation); False → 2× forward (selective
+        checkpointing, more realistic for Megatron-class runs).
         """
         del name, role
         plan = self.build_plan(model, workload)
-        return assemble(plan, placement, devices, topology)
+        return assemble(plan, placement, devices, topology, recompute=recompute)
 
 
 # ---- MegatronScheme ---------------------------------------------------------
@@ -519,6 +524,7 @@ def assemble(
     placement: Placement,
     devices: list[Device],
     topology: Optional[HostTopo] = None,
+    recompute: bool = False,
 ) -> ModelMapping:
     """Combine a scheme-produced `Plan` with a `Placement` to produce a
     fully-resolved `ModelMapping`. Device-binding happens here.
@@ -527,6 +533,9 @@ def assemble(
     placement callable; constructs the ModelMapping with the decorated
     patterns from the plan, leaving NetworkOp resolution to ModelMapping's
     own __post_init__.
+
+    `recompute` is forwarded to the `ModelMapping` (TRAINING-only knob —
+    True = full activation recomputation, False = selective checkpointing).
     """
     s2d = placement(plan, devices, topology)
     if set(s2d.keys()) != set(plan.shards):
@@ -545,6 +554,7 @@ def assemble(
         device_to_shard=d2s,
         forward_pattern=plan.forward_pattern,
         decode_pattern=plan.decode_pattern,
+        recompute=recompute,
     )
 
 

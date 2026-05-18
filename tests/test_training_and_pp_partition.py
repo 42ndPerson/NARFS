@@ -48,7 +48,9 @@ def _make_model() -> LlamaModel:
     )
 
 
-def _make_mapping(workload: Workload, parallelism: ParallelismConfig) -> ModelMapping:
+def _make_mapping(
+    workload: Workload, parallelism: ParallelismConfig, recompute: bool = False,
+) -> ModelMapping:
     """Constructs a 1-host-per-shard mesh sized to (dp * pp * tp).
 
     Shards laid out by (dp, pp, tp) → host_id deterministically.
@@ -59,6 +61,7 @@ def _make_mapping(workload: Workload, parallelism: ParallelismConfig) -> ModelMa
         model=model,
         workload=workload,
         devices=[_dev(i) for i in range(num_devs)],
+        recompute=recompute,
     )
 
 
@@ -125,18 +128,34 @@ def test_simulate_pp2_partition_and_stage_times():
 
 
 def test_training_includes_backward_and_per_layer_optimizer():
-    mm = _make_mapping(Workload.TRAINING, ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
+    # Use recompute=True to exercise the 3x scaling path (default is now
+    # recompute=False → 2x, matching selective-checkpointing reality).
+    mm = _make_mapping(
+        Workload.TRAINING, ParallelismConfig(tp=2, pp=1, dp=1, ep=1), recompute=True,
+    )
 
     backward_ops = [op for op in mm.operator_pattern if isinstance(op, BackwardOp)]
     assert backward_ops, "expected BackwardOp instances in training pattern"
 
-    # Spot-check 3x scaling on a backward op: pick one and compare to its forward.
+    # Spot-check 3x scaling on a backward op (recompute=True).
     sample = backward_ops[0]
     ctx = _ctx()
     fwd_flops = sample.forward.compute_flops(ctx)
     bwd_flops = sample.compute_flops(ctx)
     if fwd_flops > 0:
         assert bwd_flops == pytest.approx(3.0 * fwd_flops)
+
+    # Also verify the default-recompute=False path gives 2x scaling.
+    mm_no_recompute = _make_mapping(
+        Workload.TRAINING, ParallelismConfig(tp=2, pp=1, dp=1, ep=1),
+    )
+    sample_no_rc = next(
+        op for op in mm_no_recompute.operator_pattern if isinstance(op, BackwardOp)
+    )
+    fwd_no_rc = sample_no_rc.forward.compute_flops(ctx)
+    bwd_no_rc = sample_no_rc.compute_flops(ctx)
+    if fwd_no_rc > 0:
+        assert bwd_no_rc == pytest.approx(2.0 * fwd_no_rc)
 
     optimizers = [op for op in mm.operator_pattern if isinstance(op, AdamOptimizerOp)]
     # One per LayerTag with non-zero parameters: n_layers numeric tags +

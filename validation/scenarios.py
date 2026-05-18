@@ -32,11 +32,19 @@ A100_80GB = HardwareSpec(
     peak_compute_flops=312e12,
     peak_memory_bandwidth=2.0e12,
     # default efficiency factors: 0.7 / 0.8 / 0.4
+    # ~10 ms per decode token: representative vLLM-class framework +
+    # kernel-launch overhead on A100 (300 kernels × ~30 μs/launch plus
+    # framework dispatch / paged-attention block management). Tune per
+    # measured deployment.
+    decode_overhead_per_token_ms=10.0,
 )
 
 H100_80GB = HardwareSpec(
     peak_compute_flops=989e12,
     peak_memory_bandwidth=3.35e12,
+    # H100 has lower per-kernel launch overhead than A100 (~5-10 μs);
+    # set per scenario when modeling decode workloads.
+    decode_overhead_per_token_ms=5.0,
 )
 
 

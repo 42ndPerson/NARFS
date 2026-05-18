@@ -168,6 +168,12 @@ class ModelMapping:
     forward_pattern: list = field(default_factory=list)
     decode_pattern: list = field(default_factory=list)
 
+    # Training option: when True, BackwardOp uses 3× forward (full
+    # activation recomputation). When False, 2× forward (selective
+    # checkpointing — closer to what Megatron-class training actually
+    # achieves). Only consulted for `Workload.TRAINING`.
+    recompute: bool = False
+
     # Computed in __post_init__:
     forward_seq: list[CombinedOp] = field(init=False, default_factory=list)
     decode_seq: list[CombinedOp] = field(init=False, default_factory=list)
@@ -196,6 +202,11 @@ class ModelMapping:
     decode_network_composition_fill_drain: NetworkComposition = field(
         init=False, default_factory=Sequential,
     )
+    # Indices of optimizer ops within forward_seq (TRAINING only). These
+    # are excluded from the per-slot bubble formula — the optimizer runs
+    # once per iteration, concurrently across PP stages, not once per
+    # microbatch slot. Added back as a one-shot `max(stage_optimizer_times)`.
+    optimizer_indices: set[int] = field(init=False, default_factory=set)
     # PP activation P2P NetworkOps. Forward fires every microbatch transition;
     # backward only in TRAINING. None when pp == 1.
     pp_p2p_op_forward: Optional[NetworkOp] = field(init=False, default=None)
@@ -285,7 +296,7 @@ class ModelMapping:
         themselves are parallelism-pure and only know full-model footprints.
         """
         forward_pattern = self.forward_pattern
-        backward_pattern = derive_backward_pattern(forward_pattern, recompute=True)
+        backward_pattern = derive_backward_pattern(forward_pattern, recompute=self.recompute)
 
         forward_expanded = expand_pattern_with_layers(forward_pattern)
         backward_expanded = expand_pattern_with_layers(backward_pattern)
@@ -312,6 +323,11 @@ class ModelMapping:
         full = forward_expanded + backward_expanded + optimizer_expanded
         self.forward_seq = self._expanded_to_seq(full)
         self.pipeline_partition = self._layer_aware_partition(self.forward_seq)
+        # Optimizer ops occupy the tail of `full` (after forward+backward).
+        # Record their indices so `_simulate_seq` can exclude them from the
+        # per-slot bubble multiplier and add them once as a max over stages.
+        n_fb = len(forward_expanded) + len(backward_expanded)
+        self.optimizer_indices = set(range(n_fb, n_fb + len(optimizer_expanded)))
 
     def _expanded_to_seq(
         self,
@@ -660,7 +676,13 @@ class ModelMapping:
                 transfer_times_fill_drain=transfer_times_fill_drain,
                 pipelined=False,
             )
-            decode_time = decode_step.total_time * max(workload_ctx.response_len, 0)
+            # Per-token decode-step time plus the configured framework /
+            # kernel-launch overhead (constant the roofline doesn't model).
+            decode_overhead_s = hw.decode_overhead_per_token_ms / 1000.0
+            decode_time = (
+                (decode_step.total_time + decode_overhead_s)
+                * max(workload_ctx.response_len, 0)
+            )
             return SimulationResult(
                 total_time=prefill.total_time + decode_time,
                 prefill_time=prefill.total_time,
@@ -746,29 +768,52 @@ class ModelMapping:
         else:
             p2p_fill_drain = p2p_steady
 
+        # Optimizer indices (if any): excluded from the per-slot bubble
+        # cost and added once as a max over stages (optimizer runs once
+        # per iteration, in parallel across PP stages).
+        opt_idx = self.optimizer_indices
+
+        def _stage_sum(per_op: list[float], stage: list[int], exclude: set[int]) -> float:
+            if not exclude:
+                return sum(per_op[i] for i in stage)
+            return sum(per_op[i] for i in stage if i not in exclude)
+
         def aggregate(per_op_per_snap: dict[str, list[float]]) -> float:
             per_op_steady = per_op_per_snap["steady"]
+            # Forward+backward stage times (excluding optimizer).
             stage_times_steady = [
-                sum(per_op_steady[i] for i in stage) for stage in partition
+                _stage_sum(per_op_steady, stage, opt_idx) for stage in partition
             ]
+            # Optimizer contribution per stage; runs once per iteration,
+            # concurrently across PP stages → max, not sum or multiplied.
+            optimizer_stage_times = [
+                sum(per_op_steady[i] for i in stage if i in opt_idx)
+                for stage in partition
+            ]
+            optimizer_total = max(optimizer_stage_times, default=0.0)
+
             if is_pipelined:
                 max_stage_steady = max(stage_times_steady)
                 if use_two_snapshot:
                     per_op_fd = per_op_per_snap["fill_drain"]
                     stage_times_fd = [
-                        sum(per_op_fd[i] for i in stage) for stage in partition
+                        _stage_sum(per_op_fd, stage, opt_idx) for stage in partition
                     ]
                     max_stage_fd = max(stage_times_fd)
                     steady_slots = max(0, nmb - pp + 1)
                     fill_drain_slots = 2 * (pp - 1)
-                    return (
+                    bubble = (
                         steady_slots * (max_stage_steady + p2p_steady)
                         + fill_drain_slots * (max_stage_fd + p2p_fill_drain)
                     )
-                return (nmb + pp - 1) * (max_stage_steady + p2p_steady)
+                else:
+                    bubble = (nmb + pp - 1) * (max_stage_steady + p2p_steady)
+                return bubble + optimizer_total
             # Unpipelined: stages run one after another per invocation.
             # Under PP this includes (pp-1) hand-offs per pass.
-            return sum(stage_times_steady) + (pp - 1) * p2p_steady
+            return (
+                sum(stage_times_steady) + (pp - 1) * p2p_steady + optimizer_total
+            )
 
         snapshots: dict[str, dict[LogicalTransfer, float]] = {"steady": transfer_times_steady}
         if use_two_snapshot:

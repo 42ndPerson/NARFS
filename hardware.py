@@ -18,3 +18,10 @@ class HardwareSpec:
     # Achievable HBM BW for GEMV-shaped GEMMs is also lower than streaming
     # bulk reads; typical 0.6-0.7 vs 0.8 for large kernels.
     gemv_memory_efficiency: float = 0.65
+    # Per-decode-step framework + kernel-launch overhead (ms). Models the
+    # constant cost outside the roofline: ~300 kernels × ~10-30 μs/launch
+    # plus framework dispatch, Python overhead, paged-attention block
+    # management in vLLM-class systems. Applied once per generated token
+    # in `MM.simulate`'s GENERATION branch. Default 0 keeps the
+    # pure-roofline model; set per scenario to a profiled value.
+    decode_overhead_per_token_ms: float = 0.0

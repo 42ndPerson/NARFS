@@ -1,4 +1,4 @@
-# Simulator validation findings — 2026-05-18T10:20:34Z
+# Simulator validation findings — 2026-05-18T10:36:34Z
 
 Generated automatically by `run_validation.py` whenever any scenario is more than 30% off its published reference. Default tolerance is 50%; training and DeepSeek-V3 are tagged as sanity bounds (100%).
 
@@ -7,44 +7,25 @@ Generated automatically by `run_validation.py` whenever any scenario is more tha
 | scenario | predicted | reference | error % | tolerance % | pass |
 |---|---:|---:|---:|---:|:---:|
 | llama2_7b_prefill_a100 | 57.6 ms | 50.0 ms | +15.2% | 50% | ✓ |
-| llama2_7b_decode_a100 | 10.3 ms | 25.0 ms | -58.6% | 50% | ✗ |
+| llama2_7b_decode_a100 | 20.3 ms | 25.0 ms | -18.6% | 50% | ✓ |
 | llama3_70b_prefill_8xa100_tp8 | 258.2 ms | 250.0 ms | +3.3% | 50% | ✓ |
-| llama3_8b_training_8xa100_tp2_pp2_dp2 | 9487.0 ms | 4000.0 ms | +137.2% | 100% | ✗ |
+| llama3_8b_training_8xa100_tp2_pp2_dp2 | 7619.9 ms | 4000.0 ms | +90.5% | 100% | ✓ |
 | deepseek_v3_prefill_32xh100_ep8_tp4 | 614.9 ms | 500.0 ms | +23.0% | 100% | ✓ |
 
 ## Per-scenario investigation
-
-### llama2_7b_decode_a100
-
-_Llama-2-7B decode, batch=1, single A100-80GB. Reference ~25ms/token (vLLM)._
-
-- **Predicted:** 10.3 ms  **Reference:** 25.0 ms  **Error:** -58.6%  **Tolerance:** ±50% (exceeds tolerance)
-
-**Dominant operators by wall-time fraction:**
-
-- `Gemm` — 94.8%
-- `PrefillAttention` — 3.0%
-- `SwiGLUActivation` — 1.0%
-- `RMSNorm` — 0.5%
-- `RoPE` — 0.5%
-- `DecodeAttention` — 0.2%
-
-**Hypothesis:**
-
-Pure roofline + GEMV efficiency tier (0.3 compute / 0.65 memory for M<16 GEMMs) is the prediction. Total memory traffic per decode step ≈ model weights once + KV cache reads. The remaining gap to measured wall time is kernel-launch overhead, sampling, and KV-cache management — the simulator's scope stops at the roofline. To close further: (a) profile actual GEMV memory_efficiency on the target A100 — typical measurements are 0.5-0.6 rather than the 0.65 default; (b) bake in a per-decode-step constant overhead after profiling a real run. Do NOT auto-tune from validation alone.
 
 ### llama3_8b_training_8xa100_tp2_pp2_dp2
 
 _Llama-3-8B training step, batch=64, microbatch=4, prompt=2048, 8xA100-80GB TP=2 PP=2 DP=2 on an NVSwitch fabric. Reference ~3-5s (Megatron-class). Sanity bound._
 
-- **Predicted:** 9487.0 ms  **Reference:** 4000.0 ms  **Error:** +137.2%  **Tolerance:** ±100% (exceeds tolerance)
+- **Predicted:** 7619.9 ms  **Reference:** 4000.0 ms  **Error:** +90.5%  **Tolerance:** ±100% (within tolerance)
 
 **Dominant operators by wall-time fraction:**
 
-- `BackwardOp` — 66.9%
-- `Gemm` — 27.1%
-- `PrefillAttention` — 3.2%
-- `AdamOptimizerOp` — 2.1%
+- `BackwardOp` — 59.6%
+- `Gemm` — 33.0%
+- `PrefillAttention` — 3.9%
+- `AdamOptimizerOp` — 2.6%
 - `SwiGLUActivation` — 0.4%
 - `RMSNorm` — 0.3%
 
