@@ -1,4 +1,4 @@
-# Simulator validation findings — 2026-05-15T06:47:37Z
+# Simulator validation findings — 2026-05-18T10:12:06Z
 
 Generated automatically by `run_validation.py` whenever any scenario is more than 30% off its published reference. Default tolerance is 50%; training and DeepSeek-V3 are tagged as sanity bounds (100%).
 
@@ -8,9 +8,9 @@ Generated automatically by `run_validation.py` whenever any scenario is more tha
 |---|---:|---:|---:|---:|:---:|
 | llama2_7b_prefill_a100 | 57.6 ms | 50.0 ms | +15.2% | 50% | ✓ |
 | llama2_7b_decode_a100 | 10.3 ms | 25.0 ms | -58.6% | 50% | ✗ |
-| llama3_70b_prefill_8xa100_tp8 | 323.9 ms | 250.0 ms | +29.6% | 50% | ✓ |
-| llama3_8b_training_8xa100_tp2_pp2_dp2 | 10258.5 ms | 4000.0 ms | +156.5% | 100% | ✗ |
-| deepseek_v3_prefill_32xh100_ep8_tp4 | 1656.7 ms | 500.0 ms | +231.3% | 100% | ✗ |
+| llama3_70b_prefill_8xa100_tp8 | 258.2 ms | 250.0 ms | +3.3% | 50% | ✓ |
+| llama3_8b_training_8xa100_tp2_pp2_dp2 | 9538.0 ms | 4000.0 ms | +138.4% | 100% | ✗ |
+| deepseek_v3_prefill_32xh100_ep8_tp4 | 614.9 ms | 500.0 ms | +23.0% | 100% | ✓ |
 
 ## Per-scenario investigation
 
@@ -37,39 +37,20 @@ Pure roofline + GEMV efficiency tier (0.3 compute / 0.65 memory for M<16 GEMMs) 
 
 _Llama-3-8B training step, batch=64, microbatch=4, prompt=2048, 8xA100-80GB TP=2 PP=2 DP=2 on an NVSwitch fabric. Reference ~3-5s (Megatron-class). Sanity bound._
 
-- **Predicted:** 10258.5 ms  **Reference:** 4000.0 ms  **Error:** +156.5%  **Tolerance:** ±100% (exceeds tolerance)
+- **Predicted:** 9538.0 ms  **Reference:** 4000.0 ms  **Error:** +138.4%  **Tolerance:** ±100% (exceeds tolerance)
 
 **Dominant operators by wall-time fraction:**
 
-- `BackwardOp` — 65.8%
-- `Gemm` — 28.5%
-- `PrefillAttention` — 3.0%
-- `AdamOptimizerOp` — 2.0%
-- `SwiGLUActivation` — 0.3%
+- `BackwardOp` — 66.9%
+- `Gemm` — 27.1%
+- `PrefillAttention` — 3.2%
+- `AdamOptimizerOp` — 2.1%
+- `SwiGLUActivation` — 0.4%
 - `RMSNorm` — 0.3%
 
 **Hypothesis:**
 
 Above reference; BackwardOp dominates the breakdown. Likely contributions: (a) BackwardOp's 3× compute / 3× memory scaling with full activation recomputation is conservative — FlashAttention backward + selective checkpointing typically achieve 2.0-2.5× rather than 3×; (b) compute_efficiency=0.7 may be high for backward kernels where memory-traffic patterns differ from forward; (c) per-layer AdamOptimizerOps get multiplied through the (num_microbatches + pp - 1) pipeline formula even though optimizer is one-shot per iteration — minor effect, but a principled fix would isolate the optimizer from the 1F1B multiplier.
-
-### deepseek_v3_prefill_32xh100_ep8_tp4
-
-_DeepSeek-V3 prefill, batch=1, prompt=4096, 32xH100-80GB EP=8 TP=4 PP=1 across 4 nodes × 8 GPUs: NVSwitch within node, IB between. TP shards attention 4-way (a TP group stays intra-node); EP=8 spans nodes. Reference ~500ms (looser bound)._
-
-- **Predicted:** 1656.7 ms  **Reference:** 500.0 ms  **Error:** +231.3%  **Tolerance:** ±100% (exceeds tolerance)
-
-**Dominant operators by wall-time fraction:**
-
-- `Gemm` — 53.4%
-- `DispatchMarker` — 16.4%
-- `CombineMarker` — 16.4%
-- `PrefillAttention` — 13.3%
-- `RMSNorm` — 0.3%
-- `RoPE` — 0.0%
-
-**Hypothesis:**
-
-Above reference. Either compute_efficiency too low for this workload, or the operator pattern includes work the reference doesn't model.
 
 ## Suggested measurements to fit constants
 

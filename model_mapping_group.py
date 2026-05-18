@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
+from contention import ContentionModel, NetworkComposition, Sequential
 from hardware import HardwareSpec
 from model_mapping import ModelMapping
 from network_op import LogicalTransfer, NetworkOp
@@ -29,25 +30,38 @@ def resolve_op_transfers(
 
 
 def steady_transfer_times(
+    composition: NetworkComposition,
     op_transfers: dict[NetworkOp, list[LogicalTransfer]],
     topo: HostTopo,
 ) -> dict[LogicalTransfer, float]:
-    """Per-transfer time under shared-bandwidth contention for steady ops."""
-    transfers = [
-        t for op, ts in op_transfers.items()
+    """Per-transfer time under composition-based contention for steady ops.
+
+    `composition` is the network composition tree describing concurrent /
+    sequential structure across one stage's MMGs and their MMs. The
+    ContentionModel walks it once to derive each NetworkOp's *background*
+    load on each link (sum of Parallel-ancestor siblings' loads,
+    Sequential-ancestor siblings contribute 0), then projects per-link
+    effective bandwidths back to per-transfer wall times.
+    """
+    steady_ops = {
+        op: ts for op, ts in op_transfers.items()
         if NetworkOp.phase_of(op) is NetworkPhase.STEADY
-        for t in ts
-    ]
-    if not transfers:
+    }
+    if not steady_ops:
         return {}
-    return topo.get_simultaneous_logical_transfer_times(transfers)
+    return ContentionModel(topo).steady_snapshot(composition, steady_ops)
 
 
 def boundary_transfer_times(
     op_transfers: dict[NetworkOp, list[LogicalTransfer]],
     topo: HostTopo,
 ) -> dict[LogicalTransfer, float]:
-    """Per-transfer time under flow-time contention for boundary ops."""
+    """Per-transfer time under flow-time contention for boundary ops.
+
+    Boundary ops (resharding) are genuinely synchronized one-shot bursts;
+    the all-at-once flow-time model is correct here. The composition tree
+    isn't used for boundary contention — only steady.
+    """
     transfers = [
         t for op, ts in op_transfers.items()
         if NetworkOp.phase_of(op) is NetworkPhase.BOUNDARY
@@ -73,6 +87,13 @@ class ModelMappingGroup:
 
     model_mappings: list[ModelMapping]
 
+    @property
+    def network_composition(self) -> NetworkComposition:
+        """The MMG's network composition: a `Sequential` over its member
+        MMs' compositions (MMs within an MMG run one after another).
+        Stage-level composition wraps these in a `Parallel`."""
+        return Sequential([mm.network_composition for mm in self.model_mappings])
+
     def simulate_isolated(
         self,
         workload_ctx: WorkloadContext,
@@ -82,11 +103,11 @@ class ModelMappingGroup:
         """Approximate single-group wall time.
 
         Cross-group contention is silently ignored — steady/boundary
-        snapshots are taken against only this group's own NetworkOps.
+        snapshots are taken against only this group's own composition.
         Use `simulate_stage` when stage-wide context is available.
         """
         op_transfers = resolve_op_transfers(workload_ctx, self.model_mappings)
-        steady_times = steady_transfer_times(op_transfers, topo)
+        steady_times = steady_transfer_times(self.network_composition, op_transfers, topo)
         boundary_times = boundary_transfer_times(op_transfers, topo)
         return sum(
             mm.simulate(

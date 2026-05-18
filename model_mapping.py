@@ -3,6 +3,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from compute_model import ComputeModel
+from contention import (
+    Empty,
+    NetworkComposition,
+    NetworkLeaf,
+    Parallel,
+    Sequential,
+)
 from hardware import HardwareSpec
 from model import Model
 from network_op import (
@@ -166,6 +174,16 @@ class ModelMapping:
     pipeline_partition: list[list[int]] = field(init=False, default_factory=list)
     decode_pipeline_partition: list[list[int]] = field(init=False, default_factory=list)
     network_ops: dict[NetworkRequirement, NetworkOp] = field(init=False, default_factory=dict)
+    # Network composition for one pipeline slot's worth of activity (or
+    # one full forward pass when pp=1). Built from forward_seq +
+    # pipeline_partition + pp_p2p_op_*. Consumed by `ContentionModel` at
+    # the stage level (composed up through MMG and stage `Parallel`).
+    network_composition: NetworkComposition = field(
+        init=False, default_factory=Sequential,
+    )
+    decode_network_composition: NetworkComposition = field(
+        init=False, default_factory=Sequential,
+    )
     # PP activation P2P NetworkOps. Forward fires every microbatch transition;
     # backward only in TRAINING. None when pp == 1.
     pp_p2p_op_forward: Optional[NetworkOp] = field(init=False, default=None)
@@ -189,6 +207,16 @@ class ModelMapping:
 
         if self.parallelism.pp > 1 and self.workload is not Workload.DORMANT:
             self._install_pp_p2p_ops()
+
+        # Build network compositions AFTER seqs + pp-p2p ops are in place.
+        if self.workload is not Workload.DORMANT:
+            self.network_composition = self._build_network_composition(
+                self.forward_seq, self.pipeline_partition,
+            )
+            if self.workload is Workload.GENERATION:
+                self.decode_network_composition = self._build_network_composition(
+                    self.decode_seq, self.decode_pipeline_partition,
+                )
 
     # ----- legacy property surface -------------------------------------------
 
@@ -284,6 +312,65 @@ class ModelMapping:
                 layer_tag=tag,
             ))
         return seq
+
+    # ----- network composition (for ContentionModel) -------------------------
+
+    def _build_network_composition(
+        self,
+        seq: list[CombinedOp],
+        partition: list[list[int]],
+    ) -> NetworkComposition:
+        """One pipeline slot's worth of network activity (or one full
+        forward pass when pp=1).
+
+        pp=1 → Sequential over every CombinedOp position: a NetworkLeaf
+        per collective, Empty for compute-only positions. Consecutive
+        empties collapse into one Empty(N).
+
+        pp>1 → Parallel over per-stage Sequentials plus the PP-P2P
+        leaves. At pipeline steady state every stage is processing some
+        microbatch concurrently, and the per-slot P2Ps fire every slot,
+        so all live as siblings under one Parallel.
+        """
+        if not seq:
+            return Sequential([])
+
+        def _co_composition(co: CombinedOp) -> NetworkComposition:
+            if not co.network_ops:
+                return Empty(1)
+            if len(co.network_ops) == 1:
+                return NetworkLeaf(co.network_ops[0])
+            # Multiple ops at one position genuinely co-occur.
+            return Parallel([NetworkLeaf(op) for op in co.network_ops])
+
+        def _stage_composition(indices: list[int]) -> NetworkComposition:
+            children: list[NetworkComposition] = []
+            empty_run = 0
+            for i in indices:
+                comp = _co_composition(seq[i])
+                if isinstance(comp, Empty):
+                    empty_run += comp.length
+                else:
+                    if empty_run > 0:
+                        children.append(Empty(empty_run))
+                        empty_run = 0
+                    children.append(comp)
+            if empty_run > 0:
+                children.append(Empty(empty_run))
+            return Sequential(children)
+
+        if self.parallelism.pp <= 1:
+            return _stage_composition(list(range(len(seq))))
+
+        stage_compositions: list[NetworkComposition] = [
+            _stage_composition(indices) for indices in partition if indices
+        ]
+        parallel_children: list[NetworkComposition] = list(stage_compositions)
+        if self.pp_p2p_op_forward is not None:
+            parallel_children.append(NetworkLeaf(self.pp_p2p_op_forward))
+        if self.pp_p2p_op_backward is not None:
+            parallel_children.append(NetworkLeaf(self.pp_p2p_op_backward))
+        return Parallel(parallel_children)
 
     # ----- layer-aware pipeline partition ------------------------------------
 
@@ -541,41 +628,47 @@ class ModelMapping:
         transfer_times_boundary: dict[LogicalTransfer, float],
         pipelined: bool,
     ) -> SimulationResult:
+        """Walk `seq` via `ComputeModel` and aggregate with a
+        partition/bubble-aware closure. The walk is parallelism-oblivious;
+        the closure owns the PP math."""
         if not seq:
             return SimulationResult(total_time=0.0, pp_stage_times=[0.0])
 
-        per_op = [
-            co.wall_time(
-                workload_ctx, hw,
-                op_transfers, transfer_times_steady, transfer_times_boundary,
-            )
-            for co in seq
-        ]
-        stage_times = [sum(per_op[i] for i in stage) for stage in partition]
-
-        if not pipelined or self.parallelism.pp <= 1:
-            total = sum(stage_times)
-            return SimulationResult(
-                total_time=total,
-                pp_stage_times=stage_times,
-                per_op_breakdown=per_op,
-            )
-
-        num_microbatches = max(workload_ctx.num_microbatches, 1)
         pp = self.parallelism.pp
-        max_stage = max(stage_times)
+        nmb = max(workload_ctx.num_microbatches, 1)
+        is_pipelined = pipelined and pp > 1
+
+        # Per-slot PP-P2P time, sized against the steady contention snapshot.
+        # Included in both pipelined and unpipelined PP paths (decode under PP
+        # still pays (pp-1)*p2p_per_mb per token; previously this was missed).
         p2p_per_mb = 0.0
-        if self.pp_p2p_op_forward is not None:
-            transfers = op_transfers.get(self.pp_p2p_op_forward, [])
-            p2p_per_mb += self.pp_p2p_op_forward.get_operator_time(
-                transfers, transfer_times_steady,
-            )
-        if self.pp_p2p_op_backward is not None:
-            transfers = op_transfers.get(self.pp_p2p_op_backward, [])
-            p2p_per_mb += self.pp_p2p_op_backward.get_operator_time(
-                transfers, transfer_times_steady,
-            )
-        total = (num_microbatches + pp - 1) * (max_stage + p2p_per_mb)
+        if pp > 1:
+            if self.pp_p2p_op_forward is not None:
+                transfers = op_transfers.get(self.pp_p2p_op_forward, [])
+                p2p_per_mb += self.pp_p2p_op_forward.get_operator_time(
+                    transfers, transfer_times_steady,
+                )
+            if self.pp_p2p_op_backward is not None:
+                transfers = op_transfers.get(self.pp_p2p_op_backward, [])
+                p2p_per_mb += self.pp_p2p_op_backward.get_operator_time(
+                    transfers, transfer_times_steady,
+                )
+
+        def aggregate(per_op: list[float]) -> float:
+            stage_times = [sum(per_op[i] for i in stage) for stage in partition]
+            if is_pipelined:
+                max_stage = max(stage_times)
+                return (nmb + pp - 1) * (max_stage + p2p_per_mb)
+            # Unpipelined: stages run one after another per invocation.
+            # Under PP this includes (pp-1) hand-offs per pass.
+            return sum(stage_times) + (pp - 1) * p2p_per_mb
+
+        cm = ComputeModel(seq=seq, aggregate_fn=aggregate)
+        total, per_op = cm.evaluate(
+            workload_ctx, hw,
+            op_transfers, transfer_times_steady, transfer_times_boundary,
+        )
+        stage_times = [sum(per_op[i] for i in stage) for stage in partition]
         return SimulationResult(
             total_time=total,
             pp_stage_times=stage_times,

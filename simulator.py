@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 
+from contention import Parallel
 from hardware import HardwareSpec
 from model_mapping import SimulationResult
 from stages import RLHFTimeline
@@ -12,6 +13,12 @@ from model_mapping_group import (
 )
 from topo import HostTopo
 from workload_context import WorkloadContext
+
+
+def _stage_composition(stage: list[ModelMappingGroup]) -> Parallel:
+    """Stage-level composition: `Parallel` over the stage's MMGs (they run
+    concurrently). Each MMG is itself a `Sequential` of its MMs."""
+    return Parallel([g.network_composition for g in stage])
 
 
 @dataclass
@@ -43,7 +50,8 @@ def simulate_stage(
 
     all_mappings = [mm for g in stage for mm in g.model_mappings]
     op_transfers = resolve_op_transfers(workload_ctx, all_mappings)
-    steady_times = steady_transfer_times(op_transfers, topo)
+    stage_comp = _stage_composition(stage)
+    steady_times = steady_transfer_times(stage_comp, op_transfers, topo)
     boundary_times = boundary_transfer_times(op_transfers, topo)
 
     group_times: list[float] = []
@@ -76,7 +84,8 @@ def simulate_rlhf_iteration(
         else:
             all_mappings = [mm for g in stage for mm in g.model_mappings]
             op_transfers = resolve_op_transfers(workload_ctx, all_mappings)
-            steady_times = steady_transfer_times(op_transfers, topo)
+            stage_comp = _stage_composition(stage)
+            steady_times = steady_transfer_times(stage_comp, op_transfers, topo)
             boundary_times = boundary_transfer_times(op_transfers, topo)
 
             group_times: list[float] = []
