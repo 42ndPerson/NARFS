@@ -1,6 +1,6 @@
 """Put the project root on sys.path so tests can use absolute imports
-(`from hardware import HardwareSpec`, `from operators.gemm import Gemm`, etc.)
-without requiring the project to be installed as a package.
+(`from topology.hardware import HardwareSpec`, `from operators.gemm import Gemm`,
+etc.) without requiring the project to be installed as a package.
 """
 from __future__ import annotations
 import sys

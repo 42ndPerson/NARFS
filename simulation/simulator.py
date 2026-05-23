@@ -1,17 +1,17 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 
-from contention import Parallel
-from hardware import HardwareSpec
-from model_mapping import SimulationResult
-from stages import RLHFTimeline
-from model_mapping_group import (
+from mapping.contention import Parallel
+from topology.hardware import HardwareSpec
+from mapping.model_mapping import SimulationResult
+from simulation.stages import RLHFTimeline
+from mapping.model_mapping_group import (
     ModelMappingGroup,
     boundary_transfer_times,
     resolve_op_transfers,
     steady_transfer_times,
 )
-from topo import HostTopo
+from topology.topo import HostTopo
 from workload_context import WorkloadContext
 
 

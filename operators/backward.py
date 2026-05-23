@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from operator_base import Operator
+from operators.base import Operator
 from operators.pattern import (
     LabeledOp,
     OperatorWithReqs,

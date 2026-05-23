@@ -25,7 +25,7 @@ from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
-from strategies import MegatronScheme
+from schemes.strategies import MegatronScheme
 
 
 SMALL_LLAMA = LlamaConfig(

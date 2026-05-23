@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from hardware import HardwareSpec
-    from model_mapping import CombinedOp
+    from topology.hardware import HardwareSpec
+    from mapping.model_mapping import CombinedOp
     from network_op import LogicalTransfer, NetworkOp
     from workload_context import WorkloadContext
 

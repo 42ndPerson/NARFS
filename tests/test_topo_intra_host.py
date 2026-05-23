@@ -6,7 +6,7 @@ divisor — no more asymmetry between flow-time and shared-bandwidth modes.
 from __future__ import annotations
 
 from network_op import LogicalTransfer
-from topo import Device, HostTopo, Link, Path
+from topology.topo import Device, HostTopo, Link, Path
 
 
 def _make_topo(bandwidth: float = 600.0, latency_ms: float = 0.0) -> tuple[HostTopo, list[Device]]:

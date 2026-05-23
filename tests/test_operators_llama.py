@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from hardware import HardwareSpec
-from operator_base import Operator
+from topology.hardware import HardwareSpec
+from operators.base import Operator
 from operators.attention import DecodeAttention, PrefillAttention
 from operators.elementwise import RMSNorm, RoPE, SwiGLUActivation
 from operators.gemm import Gemm

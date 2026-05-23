@@ -14,18 +14,18 @@ new behavior:
 """
 from __future__ import annotations
 
-from hardware import HardwareSpec
-from model_mapping import ModelMapping
-from model_mapping_group import ModelMappingGroup
+from topology.hardware import HardwareSpec
+from mapping.model_mapping import ModelMapping
+from mapping.model_mapping_group import ModelMappingGroup
 from network_op import P2P
 from network_requirement import CollectiveKind, NetworkRequirement
 from parallelism import ParallelismConfig, ParallelismGroup
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
-from relation import NetworkPhase
-from simulator import simulate_stage
-from strategies import MegatronScheme
-from topo import Device, HostTopo, Link, Path
+from network_op import NetworkPhase
+from simulation.simulator import simulate_stage
+from schemes.strategies import MegatronScheme
+from topology.topo import Device, HostTopo, Link, Path
 from workload_context import Workload, WorkloadContext
 
 
@@ -157,7 +157,7 @@ def test_pp_p2p_forward_goes_pp0_to_pp1_backward_reverses():
 
 
 def test_pp_p2p_size_matches_T_h_dtype_after_resolve():
-    from model_mapping_group import resolve_op_transfers
+    from mapping.model_mapping_group import resolve_op_transfers
 
     mm = _make_mapping(
         ParallelismConfig(tp=1, pp=2, dp=1), Workload.TRAINING, [0, 1],
@@ -225,7 +225,7 @@ def test_pp_p2p_in_network_ops_dict_for_refresh():
 
 
 def test_pp_p2p_size_scales_with_microbatch_size():
-    from model_mapping_group import resolve_op_transfers
+    from mapping.model_mapping_group import resolve_op_transfers
 
     mm = _make_mapping(
         ParallelismConfig(tp=1, pp=2, dp=1), Workload.TRAINING, [0, 1],

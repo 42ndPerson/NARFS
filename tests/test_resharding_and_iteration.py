@@ -4,9 +4,9 @@ import math
 
 import pytest
 
-from hardware import HardwareSpec
-from model_mapping import ModelMapping
-from model_mapping_group import ModelMappingGroup
+from topology.hardware import HardwareSpec
+from mapping.model_mapping import ModelMapping
+from mapping.model_mapping_group import ModelMappingGroup
 from network_op import (
     LogicalTransfer,
     NetworkOp,
@@ -15,16 +15,16 @@ from network_op import (
 from parallelism import ParallelismConfig
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
-from relation import NetworkPhase
-from operators.llama_resharding import (
+from network_op import NetworkPhase
+from schemes.llama_resharding import (
     MegatronToMegatronP2P,
     llama_total_parameter_bytes,
 )
-from simulator import simulate_rlhf_iteration, simulate_stage
-from stages import RLHFTimeline, StageBoundary
-from strategies import MegatronScheme
-from topo import Device, HostTopo, Link, Path
-from transition import StageTransition
+from simulation.simulator import simulate_rlhf_iteration, simulate_stage
+from simulation.stages import RLHFTimeline, StageBoundary
+from schemes.strategies import MegatronScheme
+from topology.topo import Device, HostTopo, Link, Path
+from simulation.transition import StageTransition
 from workload_context import (
     Workload,
     WorkloadContext,

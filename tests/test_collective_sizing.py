@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from hardware import HardwareSpec
-from model_mapping import ModelMapping
+from topology.hardware import HardwareSpec
+from mapping.model_mapping import ModelMapping
 from network_op import (
     AllReduceRing,
     AllToAll,
@@ -27,10 +27,10 @@ from network_requirement import CollectiveKind, NetworkRequirement
 from parallelism import ParallelismConfig, ParallelismGroup
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
-from relation import Relation
-from strategies import MegatronScheme
-from model_mapping_group import resolve_op_transfers
-from topo import Device, HostTopo, Link, Path
+from network_requirement import Relation
+from schemes.strategies import MegatronScheme
+from mapping.model_mapping_group import resolve_op_transfers
+from topology.topo import Device, HostTopo, Link, Path
 from workload_context import (
     TokenCount,
     Workload,
@@ -157,8 +157,8 @@ def test_doubling_prompt_len_doubles_ar_transfer_size():
 def test_tp_ar_time_scales_with_microbatch():
     """End-to-end: run simulate twice with microbatch 1 vs 2; the per-AR
     network time approximately doubles (modulo latency floor)."""
-    from simulator import simulate_stage
-    from model_mapping_group import ModelMappingGroup
+    from simulation.simulator import simulate_stage
+    from mapping.model_mapping_group import ModelMappingGroup
 
     mm = _make_mapping(ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
     group = ModelMappingGroup(model_mappings=[mm])

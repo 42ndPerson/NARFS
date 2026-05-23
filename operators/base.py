@@ -2,7 +2,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from workload_context import WorkloadContext
 
 

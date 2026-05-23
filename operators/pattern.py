@@ -3,9 +3,9 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, NamedTuple, Optional, Union
 
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from network_requirement import NetworkRequirement
-from operator_base import Operator
+from operators.base import Operator
 from workload_context import WorkloadContext
 
 

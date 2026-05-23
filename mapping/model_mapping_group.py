@@ -1,12 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from contention import ContentionModel, NetworkComposition, Sequential
-from hardware import HardwareSpec
-from model_mapping import ModelMapping
+from mapping.contention import ContentionModel, NetworkComposition, Sequential
+from topology.hardware import HardwareSpec
+from mapping.model_mapping import ModelMapping
 from network_op import LogicalTransfer, NetworkOp
-from relation import NetworkPhase
-from topo import HostTopo
+from network_op import NetworkPhase
+from topology.topo import HostTopo
 from workload_context import WorkloadContext
 
 

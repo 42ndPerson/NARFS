@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from operators.gemm import Gemm
 from workload_context import (
     TokenCount,

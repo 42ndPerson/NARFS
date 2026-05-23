@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from hardware import HardwareSpec
-from model_mapping import ModelMapping
+from topology.hardware import HardwareSpec
+from mapping.model_mapping import ModelMapping
 from network_op import AllReduceRing
 from network_requirement import CollectiveKind
 from parallelism import ParallelismConfig, ParallelismGroup
@@ -11,8 +11,8 @@ from operators.backward import BackwardOp
 from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.optimizer import AdamOptimizerOp
-from strategies import MegatronScheme
-from topo import Device
+from schemes.strategies import MegatronScheme
+from topology.topo import Device
 from workload_context import Workload, WorkloadContext
 
 
@@ -222,7 +222,7 @@ def test_pp_partition_v3_balances_cost():
 
     # Compute per-stage cost at the reference workload the partitioner used.
     # Use the strategy-baked compute_time_fn on each CombinedOp (per-rank).
-    from model_mapping import _PARTITION_REF_HW
+    from mapping.model_mapping import _PARTITION_REF_HW
     ref_ctx = mm._reference_partition_ctx()
     stage_costs = [
         sum(

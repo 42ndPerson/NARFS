@@ -25,14 +25,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from model_mapping import ModelMapping, SimulationResult
+from mapping.model_mapping import ModelMapping, SimulationResult
 from parallelism import ParallelismConfig
-from operator_base import Operator
-from simulator import simulate_rlhf_iteration
-from stages import RLHFTimeline
-from strategies import MegatronScheme
-from model_mapping_group import ModelMappingGroup
-from topo import Device, HostTopo, Link, Path as TopoPath
+from operators.base import Operator
+from simulation.simulator import simulate_rlhf_iteration
+from simulation.stages import RLHFTimeline
+from schemes.strategies import MegatronScheme
+from mapping.model_mapping_group import ModelMappingGroup
+from topology.topo import Device, HostTopo, Link, Path as TopoPath
 from validation.scenarios import SCENARIOS, Scenario
 
 

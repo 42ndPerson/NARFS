@@ -2,14 +2,19 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, ClassVar, Optional
 
-from relation import NetworkPhase
-from shard import Shard
-from topo import Device, HostTopo
+from parallelism import Shard
+from topology.topo import Device, HostTopo
 
 if TYPE_CHECKING:
-    from model_mapping import ModelMapping
+    from mapping.model_mapping import ModelMapping
+
+
+class NetworkPhase(Enum):
+    STEADY = "steady"      # repeats throughout a stage; bandwidth-shared contention
+    BOUNDARY = "boundary"  # one-shot at stage edges; flow-time contention
 
 
 @dataclass(frozen=True, eq=False)

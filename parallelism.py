@@ -18,6 +18,20 @@ per-operator role.
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from model import Model
+
+
+@dataclass(frozen=True)
+class Shard:
+    """A single rank in a (dp, pp, tp, ep) parallelism mesh for one model."""
+    model: "Model"
+    dp: int  # data parallel rank
+    pp: int  # pipeline parallel rank
+    tp: int  # tensor parallel rank
+    ep: int = 0  # expert parallel rank (0 = no EP / degenerate single-rank EP group)
 
 
 @dataclass(frozen=True)

@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Iterator, Optional
 
 if TYPE_CHECKING:
     from network_op import LogicalTransfer, NetworkOp
-    from topo import HostTopo, Link
+    from topology.topo import HostTopo, Link
 
 
 # ---- composition primitives -------------------------------------------------

@@ -15,7 +15,7 @@ explicitly calls out a "sanity bound" rather than a tight target.
 from __future__ import annotations
 from dataclasses import dataclass
 
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from model import ArchitectureConfig
 from parallelism import ParallelismConfig
 from model import Model

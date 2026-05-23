@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from hardware import HardwareSpec
-from operator_base import Operator
+from topology.hardware import HardwareSpec
+from operators.base import Operator
 from workload_context import Workload, WorkloadContext
 
 

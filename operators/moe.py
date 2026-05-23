@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from operator_base import Operator
+from operators.base import Operator
 from operators.elementwise import SwiGLUActivation
 from operators.gemm import Gemm
 from operators.pattern import LabeledOp, OpRole

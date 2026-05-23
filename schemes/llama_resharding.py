@@ -10,12 +10,12 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
-from model_mapping import ModelMapping
+from mapping.model_mapping import ModelMapping
 from network_op import NetworkOp, P2P
 from operators.llama_config import LlamaConfig
-from shard import Shard
-from strategies import ReshardingScheme
-from topo import Device
+from parallelism import Shard
+from schemes.strategies import ReshardingScheme
+from topology.topo import Device
 
 
 @dataclass(frozen=True)

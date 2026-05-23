@@ -3,15 +3,15 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from compute_model import ComputeModel
-from contention import (
+from mapping.compute_model import ComputeModel
+from mapping.contention import (
     Empty,
     NetworkComposition,
     NetworkLeaf,
     Parallel,
     Sequential,
 )
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from model import Model
 from network_op import (
     AllGatherRing,
@@ -23,7 +23,7 @@ from network_op import (
     ReduceScatterRing,
 )
 from network_requirement import CollectiveKind, NetworkRequirement
-from operator_base import Operator
+from operators.base import Operator
 from operators.backward import derive_backward_pattern
 from operators.pattern import (
     LayerTag,
@@ -32,9 +32,10 @@ from operators.pattern import (
 )
 from operators.optimizer import AdamOptimizerOp
 from parallelism import ParallelismConfig, ParallelismGroup
-from relation import NetworkPhase, Relation
-from shard import Shard
-from topo import Device
+from network_op import NetworkPhase
+from network_requirement import Relation
+from parallelism import Shard
+from topology.topo import Device
 from workload_context import Workload, WorkloadContext
 
 
@@ -196,12 +197,6 @@ class ModelMapping:
     network_composition_fill_drain: NetworkComposition = field(
         init=False, default_factory=Sequential,
     )
-    decode_network_composition: NetworkComposition = field(
-        init=False, default_factory=Sequential,
-    )
-    decode_network_composition_fill_drain: NetworkComposition = field(
-        init=False, default_factory=Sequential,
-    )
     # Indices of optimizer ops within forward_seq (TRAINING only). These
     # are excluded from the per-slot bubble formula — the optimizer runs
     # once per iteration, concurrently across PP stages, not once per
@@ -232,6 +227,10 @@ class ModelMapping:
             self._install_pp_p2p_ops()
 
         # Build network compositions AFTER seqs + pp-p2p ops are in place.
+        # Only the forward composition is materialized; the simulator reuses
+        # the same `transfer_times_steady` snapshot for the decode leg
+        # (decode runs on the same MM and the per-link load picture is
+        # close enough that a second snapshot would just duplicate work).
         if self.workload is not Workload.DORMANT:
             self.network_composition = self._build_network_composition(
                 self.forward_seq, self.pipeline_partition,
@@ -239,15 +238,6 @@ class ModelMapping:
             self.network_composition_fill_drain = self._build_network_composition_fill_drain(
                 self.forward_seq, self.pipeline_partition,
             )
-            if self.workload is Workload.GENERATION:
-                self.decode_network_composition = self._build_network_composition(
-                    self.decode_seq, self.decode_pipeline_partition,
-                )
-                self.decode_network_composition_fill_drain = (
-                    self._build_network_composition_fill_drain(
-                        self.decode_seq, self.decode_pipeline_partition,
-                    )
-                )
 
     # ----- legacy property surface -------------------------------------------
 

@@ -1,11 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from network_op import NetworkOp
-from model_mapping_group import ModelMappingGroup
-from topo import HostTopo
-from transition import StageTransition
+from mapping.model_mapping_group import ModelMappingGroup
+from topology.topo import HostTopo
+from simulation.transition import StageTransition
 
 
 @dataclass

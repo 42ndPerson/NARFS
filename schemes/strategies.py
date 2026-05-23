@@ -26,12 +26,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from model import Model
-from model_mapping import ModelMapping
+from mapping.model_mapping import ModelMapping
 from network_op import NetworkOp
 from network_requirement import CollectiveKind, NetworkRequirement
-from operator_base import Operator
+from operators.base import Operator
 from operators.llama_config import LlamaConfig
 from operators.pattern import (
     LabeledOp,
@@ -48,9 +48,9 @@ from parallelism import (
     ParallelismRole,
     TPMode,
 )
-from relation import Relation
-from shard import Shard
-from topo import Device, HostTopo
+from network_requirement import Relation
+from parallelism import Shard
+from topology.topo import Device, HostTopo
 from workload_context import TokenCount, Workload, WorkloadContext
 
 

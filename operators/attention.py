@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from operator_base import Operator
+from operators.base import Operator
 from workload_context import WorkloadContext
 
 

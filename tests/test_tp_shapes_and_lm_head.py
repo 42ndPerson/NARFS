@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from network_requirement import CollectiveKind, NetworkRequirement
 from parallelism import ParallelismConfig, ParallelismGroup
 from operators.attention import DecodeAttention
@@ -26,8 +26,8 @@ from operators.llama_config import LlamaConfig
 from operators.pattern import LabeledOp, expand_tagged_pattern
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
-from strategies import MegatronScheme
-from topo import Device
+from schemes.strategies import MegatronScheme
+from topology.topo import Device
 from workload_context import (
     Workload,
     WorkloadContext,

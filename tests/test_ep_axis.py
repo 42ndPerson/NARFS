@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from hardware import HardwareSpec
+from topology.hardware import HardwareSpec
 from network_op import AllToAll, AllReduceRing
 from network_requirement import CollectiveKind
 from parallelism import ParallelismConfig, ParallelismGroup
@@ -21,9 +21,9 @@ from operators.llama_builder import LlamaModel
 from operators.llama_config import LlamaConfig
 from operators.v3_block import V3Model
 from operators.v3_config import V3Config
-from shard import Shard
-from strategies import MegatronScheme
-from topo import Device
+from parallelism import Shard
+from schemes.strategies import MegatronScheme
+from topology.topo import Device
 from workload_context import Workload
 
 

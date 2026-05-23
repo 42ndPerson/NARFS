@@ -1,13 +1,13 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 
-from hardware import HardwareSpec
-from model_mapping import ModelMapping
+from topology.hardware import HardwareSpec
+from mapping.model_mapping import ModelMapping
 from network_op import NetworkOp
-from operators.llama_resharding import MegatronToMegatronP2P
-from relation import NetworkPhase
-from strategies import ReshardingScheme
-from topo import HostTopo
+from schemes.llama_resharding import MegatronToMegatronP2P
+from network_op import NetworkPhase
+from schemes.strategies import ReshardingScheme
+from topology.topo import HostTopo
 
 
 @dataclass

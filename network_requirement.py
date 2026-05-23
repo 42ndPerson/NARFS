@@ -4,10 +4,14 @@ from enum import Enum
 from typing import TYPE_CHECKING, Callable, Hashable, Optional
 
 from parallelism import ParallelismGroup
-from relation import Relation
 
 if TYPE_CHECKING:
     from workload_context import WorkloadContext
+
+
+class Relation(Enum):
+    EXCLUSIVE = "exclusive"
+    CONCURRENT = "concurrent"
 
 
 class CollectiveKind(Enum):
