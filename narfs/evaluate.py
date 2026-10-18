@@ -293,8 +293,7 @@ def _genbatch(b: GenBatch, ctx: EvalContext) -> Summary:
     per-token collectives.
     """
     net, spec = ctx.net, ctx.spec()
-    replicas = ctx.placement.degrees.data
-    n = max(1, -(-b.requests // replicas))
+    n = max(1, b.replica_requests)
     lengths = np.asarray(b.lengths, dtype=float)
     probs = np.asarray(b.probs, dtype=float) / float(np.sum(b.probs))
     mean_len = float((lengths * probs).sum())
@@ -304,8 +303,8 @@ def _genbatch(b: GenBatch, ctx: EvalContext) -> Summary:
     comm_alpha, comm_per_seq, demand_per_seq = 0.0, 0.0, None
     for c in b.comm:
         s = evaluate(c, ctx)
-        lat = K.steps_latency(c.kind, ctx.placement.groups(c.axis), net) * c.count \
-            if ctx.placement.degrees.of(c.axis) > 1 else 0.0
+        groups = ctx.placement.groups(c.axis)
+        lat = K.steps_latency(c.kind, groups, net) * c.count if groups.shape[1] > 1 else 0.0
         comm_alpha += lat
         comm_per_seq += s.t - lat
         demand_per_seq = _add(demand_per_seq, s.demand)

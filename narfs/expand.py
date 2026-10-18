@@ -194,7 +194,7 @@ def expand_generate(arch: Architecture, deg: Degrees, rules: ShardingRules, prof
     c = _shape_ctx(arch, deg, rules, profile.with_(sequence_parallel=False),
                    per_replica * wl.prompt_len, wl.prompt_len)
     prefill = _stage_blocks(c, arch.layer_list(), True, True, train=False)[0]
-    return GenBatch(requests=wl.global_batch, prompt_len=wl.prompt_len, lengths=tuple(wl.lengths),
+    return GenBatch(replica_requests=per_replica, prompt_len=wl.prompt_len, lengths=tuple(wl.lengths),
                     probs=tuple(wl.probs), kernels_per_step=arch.n_layers * profile.gen_kernels_per_layer,
                     max_seqs=profile.gen_max_seqs, kv_capacity_tokens=kv_capacity_tokens,
                     comm=tuple(comm), prefill=Seq((prefill,), name="prefill"), **rates)

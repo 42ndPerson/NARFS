@@ -109,7 +109,8 @@ def test_moe_grad_sync_uses_both_replica_groups():
 
 def test_generation_expansion():
     gb = expand_generate(LLAMA3_8B, Degrees(dp=2, tp=4), MEGATRON, VLLM_DEFAULT, WL, 1e6)
-    assert isinstance(gb, GenBatch) and gb.requests == 64
+    assert isinstance(gb, GenBatch) and gb.replica_requests == 32      # 64 requests over dp = 2
+    assert expand_generate(SMALL_MOE, Degrees(dp=2, ep=2), MEGATRON, VLLM_DEFAULT, WL, 1e6).replica_requests == 16
     assert [c.axis for c in gb.comm] == ["tp"] and gb.comm[0].count == 2 * 32
     with pytest.raises(ValueError):
         expand_generate(LLAMA3_8B, Degrees(pp=2), MEGATRON, VLLM_DEFAULT, WL, 1e6)

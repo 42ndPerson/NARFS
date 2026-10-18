@@ -154,12 +154,14 @@ class AsyncPipe:
 @dataclass(frozen=True)
 class GenBatch:
     """Generation by a continuous-batching engine, as a closed form over
-    decode steps. All per-rank quantities are for one replica (one dp index).
+    decode steps. All quantities are for ONE replica (one dp x ep index):
+    expansion splits the requests over the replicas, so the evaluator needs
+    no degrees.
 
     lengths / probs: the response length distribution.
     comm: collectives per decode step, each sized for ONE sequence.
     """
-    requests: int
+    replica_requests: int        # requests served by one replica
     prompt_len: float
     lengths: tuple
     probs: tuple
