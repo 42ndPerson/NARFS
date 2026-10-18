@@ -13,6 +13,9 @@ training and decode workloads (where overheads the roofline doesn't model
 dominate). See [validation/findings.md](validation/findings.md) and the
 limitations section below for the per-scenario story.
 
+> **New:** a rebuild of the simulator for placement search is in
+> [narfs/](narfs/README.md). It sits beside this code and does not change it.
+
 ## Architecture
 
 The codebase is organized into five layers, bottom-up:
