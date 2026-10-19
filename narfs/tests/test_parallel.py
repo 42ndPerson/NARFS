@@ -1,11 +1,10 @@
 """Layout layer: degrees, mapping, handles and layout transfers."""
-import numpy as np
 import pytest
 
 from narfs.blocks import Collective, OnDevices, Seq, Transfer
-from narfs.parallel.binding import Binder, Boundary, Devices, Group, Hosts, Pool, Reshard, handles
+from narfs.parallel.binding import Binder, Boundary, Devices, Group, Hosts, Pool, handles
 from narfs.parallel.layouts import ParamLayout, reshard_pairs
-from narfs.parallel.mesh import AXES, Degrees, map_devices, stage_split
+from narfs.parallel.mesh import Degrees, map_devices, stage_split
 
 
 def test_degrees():

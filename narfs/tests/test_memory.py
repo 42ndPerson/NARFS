@@ -5,10 +5,10 @@ import pytest
 from narfs.expand import Batch
 from narfs.hardware import H100_SXM
 from narfs.memory import CallMemory, check, generate_memory, kv_problem, train_memory
-from narfs.model.architecture import LLAMA3_70B, LLAMA3_8B, llama
+from narfs.model.architecture import LLAMA3_70B, llama
 from narfs.model.library import model_params
 from narfs.parallel.mesh import Degrees, map_devices
-from narfs.profiles import MEGATRON_DEFAULT, TrainProfile, load_engine
+from narfs.profiles import MEGATRON_DEFAULT, load_engine
 
 EPROF, _ = load_engine("vllm-573f2f9-h100")
 TINY = llama("tiny", 1024, 8, 8, 8, 4096, 32000)

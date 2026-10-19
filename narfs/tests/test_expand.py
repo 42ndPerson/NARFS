@@ -1,8 +1,7 @@
 """Schedule and overlap lowerings, checked against their closed forms."""
-import numpy as np
 import pytest
 
-from narfs.blocks import Collective, Compute, OnDevices, Par, Repeat, Seq, Transfer
+from narfs.blocks import Collective, Compute, OnDevices, Par, Seq, Transfer
 from narfs.costs import ComputeModel
 from narfs.evaluate import Evaluator, evaluate
 from narfs.expand import Batch, lower_call, microbatches, one_f_one_b, overlap, stage_layers
@@ -10,7 +9,7 @@ from narfs.hardware import DATA, H100_SXM
 from narfs.model.architecture import LLAMA3_8B, MIXTRAL_8X7B, llama
 from narfs.network.comm import load_nccl
 from narfs.network.presets import hgx_h100
-from narfs.parallel.binding import Binder, Boundary, Devices, Group
+from narfs.parallel.binding import Binder, Boundary, Group
 from narfs.parallel.mesh import Degrees, map_devices
 from narfs.physics import Physics
 from narfs.profiles import MEGATRON_DEFAULT, TrainProfile

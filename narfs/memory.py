@@ -32,7 +32,7 @@ from narfs.expand import Batch, microbatch_tokens, microbatches, stage_layers, s
 from narfs.hardware import DTYPE_BYTES, GpuProfile
 from narfs.model.architecture import Architecture
 from narfs.model.library import get, make_ctx
-from narfs.parallel.mesh import Degrees, Placement
+from narfs.parallel.mesh import Degrees
 from narfs.profiles import EngineProfile, TrainProfile
 
 

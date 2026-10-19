@@ -5,7 +5,7 @@ import heapq
 import numpy as np
 import pytest
 
-from narfs.blocks import Collective, Compute, OnDevices, Par, Seq, Work
+from narfs.blocks import Collective, Compute, OnDevices, Par, Work
 from narfs.costs import ComputeModel, HostModel
 from narfs.engine import lower_generate, slots
 from narfs.evaluate import Evaluator, evaluate

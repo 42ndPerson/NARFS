@@ -21,7 +21,7 @@ adjoint. A component overrides `backward` only when the rules do not fit.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from narfs import costs

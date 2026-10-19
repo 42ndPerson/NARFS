@@ -6,7 +6,7 @@ from narfs.blocks import Collective, Compute, OnDevices, Par, Repeat, Seq
 from narfs.model.architecture import (DEEPSEEK_V3, LLAMA3_70B, LLAMA3_8B, MIXTRAL_8X7B, Architecture, pattern,
                                       runs)
 from narfs.model.hf_import import from_hf_config
-from narfs.model.library import (Ctx, TokenMix, backward, check_architecture, get, layer_params, make_ctx,
+from narfs.model.library import (TokenMix, backward, check_architecture, get, layer_params, make_ctx,
                                  model_params)
 from narfs.parallel.mesh import Degrees
 from narfs.parallel.rules import MEGATRON
