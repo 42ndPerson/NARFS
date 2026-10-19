@@ -1,40 +1,66 @@
-"""Small fixtures with numbers that are easy to check by hand.
+"""A toy L0 for core tests: numbers that are easy to check by hand.
 
-The unit device does 1 flop/s and moves 1 byte/s at 100% efficiency with no
-launch time, so an Op("memory", 0, b) takes exactly b seconds.
+Resources have names and capacities. A `Compute` leaf's work is its time in
+seconds. A handle binds to a demand per unit amount, as {resource: units},
+or for a device set to a list of GPU resource names (capacity 1 s/s).
 """
 from __future__ import annotations
 
 import numpy as np
 
-from narfs.costs import CostModel
-from narfs.evaluate import EvalContext
-from narfs.hardware import DeviceSpec
-from narfs.network.topology import Cluster
-from narfs.parallel.mesh import Degrees, Placement, map_devices
 
-UNIT = DeviceSpec("unit", peak_flops=1.0, hbm_bw=1.0, hbm_bytes=1e12, compute_eff=1.0,
-                  small_gemm_eff=1.0, gemv_eff=1.0, memory_eff=1.0, gemv_memory_eff=1.0,
-                  launch_s=0.0, pcie_bw=1.0)
+class ToyLeaves:
+    def __init__(self, caps: dict[str, float], latency: float = 0.0):
+        self.names = list(caps)
+        self.cap = np.array([float(caps[n]) for n in self.names])
+        self.n_resources = len(self.names)
+        self.index = {n: i for i, n in enumerate(self.names)}
+        self.latency = latency
+        self.compute_calls = 0
+        self._units: list = []
+        self._ids: dict = {}
 
+    def _uid(self, key, demand: dict) -> int:
+        uid = self._ids.get(key)
+        if uid is None:
+            idx = np.array([self.index[n] for n in demand], dtype=np.int64)
+            val = np.array([demand[n] / self.cap[self.index[n]] for n in demand])
+            uid = self._ids[key] = len(self._units)
+            self._units.append((idx, val))
+        return uid
 
-def tiny_cluster(nodes: int = 2, gpus_per_node: int = 2, **kw) -> Cluster:
-    args = dict(nvlink_bw=100.0, nic_bw=10.0, nvlink_alpha=0.0, nic_alpha=0.0, nodes_per_rail_group=2)
-    args.update(kw)
-    return Cluster(nodes=nodes, gpus_per_node=gpus_per_node, devices=(UNIT,), **args)
+    def _leaf(self, key, demand: dict, amount: float):
+        uid = self._uid(key, demand)
+        idx, val = self._units[uid]
+        t = amount * float(val.max()) if val.size else 0.0
+        return t + (self.latency if amount else 0.0), {uid: amount}
 
+    def compute(self, work, device_class) -> float:
+        self.compute_calls += 1
+        return float(work)
 
-def one_device(d: int = 0) -> Placement:
-    return Placement(Degrees(), np.array([d]).reshape(1, 1, 1, 1, 1))
+    def collective(self, node, binding):
+        return self._leaf(("coll", node.comm), binding[node.comm], node.bytes)
 
+    def transfer(self, node, binding):
+        return self._leaf(("xfer", node.pairs, node.reverse), binding[node.pairs], node.bytes)
 
-def ctx_for(net: Cluster, placements: dict, serial: bool = False) -> EvalContext:
-    return EvalContext(net, CostModel(), placements, serial=serial)
+    def work(self, node, binding):
+        uid = self._uid(("work", node.resource), {binding[node.resource]: 1.0})
+        idx, val = self._units[uid]
+        return float(node.amount) * float(val.max()), {uid: float(node.amount)}
 
+    def busy(self, devset, binding) -> int:
+        return self._uid(("busy", devset), {g: 1.0 for g in binding[devset]})
 
-def mem(seconds: float, name: str = "") -> "Op":
-    from narfs.blocks import Op
-    return Op("memory", 0.0, float(seconds), name=name)
+    def device_class(self, devset, binding):
+        return "unit"
 
+    def unit(self, uid):
+        return self._units[uid]
 
-__all__ = ["UNIT", "tiny_cluster", "one_device", "ctx_for", "mem", "map_devices", "Degrees"]
+    def resource_name(self, r: int) -> str:
+        return self.names[r]
+
+    def describe(self, node, binding, device_class) -> str:
+        return "toy leaf"

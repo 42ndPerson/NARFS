@@ -1,188 +1,153 @@
-"""Block types: the structure that expansion emits and the evaluator times.
+"""L1 node types: the structure that lowerings emit and the evaluator times.
 
-Structure is small frozen objects. `Repeat` keeps trees small, so a tree is
-cheap to rebuild for every candidate. Blocks hold no device arrays: a
-collective names a mesh axis, and the evaluator gets the device groups from
-the placement of the enclosing `Call`.
+The core has eight node types and no knowledge of models, frameworks or
+parallelism:
+
+    leaves:      Compute, Collective, Transfer, Work
+    combinators: Seq, Par, Repeat, OnDevices
+
+Leaves carry physical work: real shapes, real bytes, and handles for device
+sets. A handle is an opaque, hashable key; the layout layer (L2) binds it to
+device arrays for one candidate, and only the L0 models read the bound arrays.
+
+Nodes compare and hash by identity, so the evaluator can memoize a node that a
+tree uses twice (for example a stage block in a pipeline's fill and in its
+steady state).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import Any, Union
+
+COLLECTIVE_KINDS = ("all_reduce", "all_gather", "reduce_scatter", "all_to_all")
+
+
+def _tuple(node, field: str) -> None:
+    value = getattr(node, field)
+    if not isinstance(value, tuple):
+        object.__setattr__(node, field, tuple(value))
 
 
 # ------------------------------------------------------------------ leaves ---
 
-@dataclass(frozen=True)
-class Op:
-    """One operator on a local (per-rank) shape.
-
-    kind: "gemm", "attention", "elementwise" or "memory".
-    shape: (M, N, K) for a GEMM, used for the efficiency tier; () otherwise.
-    """
-    kind: str
-    flops: float
-    bytes: float
-    shape: tuple = ()
-    kernels: int = 1
-    count: int = 1
+@dataclass(frozen=True, eq=False)
+class Compute:
+    """GPU work on the devices of the enclosing scope, costed by the compute
+    model on that scope's device class. `work` is an L0 work item (a kernel)."""
+    work: Any
     name: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Collective:
-    """One collective on a mesh axis of the enclosing call, as a lockstep
-    burst over every instance of that axis. `size` is bytes per rank."""
-    kind: str          # "allreduce", "allgather", "reducescatter", "alltoall"
-    axis: str | tuple  # "tp", "dp", "ep", "cp", or a tuple such as ("dp", "ep")
-                       # (pp transfers use StageP2P)
-    size: float
-    count: int = 1
+    """One collective on every instance of a communication group at once.
+
+    `bytes` follows the nccl-tests convention, per rank: the buffer of an
+    all-reduce, the output of an all-gather, the input of a reduce-scatter, and
+    the total sent by one rank in an all-to-all. `lib` names the communication
+    library profile that runs it."""
+    kind: str
+    comm: Any
+    bytes: float
+    lib: str = "nccl"
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind not in COLLECTIVE_KINDS:
+            raise ValueError(f"unknown collective kind {self.kind!r}; expected one of {COLLECTIVE_KINDS}")
+        if self.bytes < 0:
+            raise ValueError("collective bytes must be >= 0")
+
+
+@dataclass(frozen=True, eq=False)
+class Transfer:
+    """Point-to-point sends over bound (src, dst, weight) pairs. Each pair moves
+    weight x `bytes`. `reverse` sends dst -> src, as for backward activations."""
+    pairs: Any
+    bytes: float = 1.0
+    reverse: bool = False
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if self.bytes < 0:
+            raise ValueError("transfer bytes must be >= 0")
+
+
+@dataclass(frozen=True, eq=False)
+class Work:
+    """`amount` on each bound resource: worker-seconds on a CPU pool, or an L0
+    work item such as one engine host step."""
+    resource: Any
+    amount: Any
     name: str = ""
 
 
-@dataclass(frozen=True)
-class StageP2P:
-    """Activation transfers between neighboring PP stages of the enclosing
-    call, for every (dp, ep, cp, tp) coordinate. `size` is bytes per rank."""
-    size: float
-    count: int = 1
-    name: str = "pp p2p"
+# -------------------------------------------------------------- combinators ---
 
-
-@dataclass(frozen=True)
-class Stream:
-    """A steady stream of `size` bytes per device of the enclosing call
-    (for example weight offload over PCIe), plus a fixed start-up time."""
-    size: float
-    kind: str = "pcie"
-    fill: float = 0.0
-    name: str = ""
-
-
-@dataclass(frozen=True)
-class Transfers:
-    """Fixed point-to-point transfers between device IDs (used for
-    resharding between calls). Built per candidate from two layouts."""
-    src: tuple
-    dst: tuple
-    size: tuple
-    name: str = "reshard"
-
-
-# -------------------------------------------------------------- composites ---
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Seq:
+    """Children one after another: t = sum of t, D = sum of D."""
     children: tuple
     name: str = ""
 
+    def __post_init__(self) -> None:
+        _tuple(self, "children")
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, eq=False)
 class Par:
+    """Children at the same time: the fluid bound,
+    t = max(max of t, max over r of the summed D[r] / C[r])."""
     children: tuple
     name: str = ""
 
+    def __post_init__(self) -> None:
+        _tuple(self, "children")
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, eq=False)
 class Repeat:
-    """`n` identical, independent repetitions of `body`: same shapes, same
-    devices, same context, no overlap across the boundary."""
-    n: int
-    body: "Block"
+    """`n` identical, independent repetitions: t = n x t, D = n x D. A real n
+    below 1 is a time slice of the body."""
+    n: float
+    body: Any
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.n >= 0:
+            raise ValueError(f"Repeat count must be >= 0, got {self.n}")
+
+
+@dataclass(frozen=True, eq=False)
+class OnDevices:
+    """Runs `body` on a bound device set. It sets the device class for the
+    Compute leaves inside, and the devices are busy for the whole scope. A
+    scope nested in another must use a subset of its devices."""
+    devset: Any
+    body: Any
     name: str = ""
 
 
-@dataclass(frozen=True)
-class OnStage:
-    """Evaluate `body` as work of one PP stage: its collectives use only
-    that stage's devices."""
-    stage: int
-    body: "Block"
-    name: str = ""
+Node = Union[Compute, Collective, Transfer, Work, Seq, Par, Repeat, OnDevices]
+LEAVES = (Compute, Collective, Transfer, Work)
 
 
-@dataclass(frozen=True)
-class Scale:
-    """A fraction of `body`: time and demand times `factor`. Used to cut a
-    block into equal chunks for overlap."""
-    factor: float
-    body: "Block"
-    name: str = ""
+def label(node) -> str:
+    """The name shown by `explain`: the node's name, else its type."""
+    return node.name or type(node).__name__
 
 
-@dataclass(frozen=True)
-class Pipeline:
-    """Pipeline over PP stages. `stages[s]` is the work of stage s for one
-    microbatch (forward, or forward + backward for 1F1B).
-
-    T = sum_s t_s / v + (nmb - 1/v) * slot, where slot is the steady-state
-    time of one microbatch with every stage active (a fluid Parallel over the
-    stages). v = 1 is 1F1B; v > 1 is the interleaved schedule.
-    """
-    stages: tuple
-    nmb: int
-    p2p: "Block | None" = None
-    virtual: int = 1
-    name: str = "pipeline"
-
-
-@dataclass(frozen=True)
-class FlowShop2:
-    """Two-stage chunk pipeline: chunk i of `b` can start only after chunk i
-    of `a` ends. T = max_k (a_1 + ... + a_k + b_k + ... + b_K).
-
-    count_a=False means the `a` work is already counted elsewhere, so only
-    the exposed part of `b` is returned. `buffer` limits how far `a` can run
-    ahead of `b` (None means unlimited)."""
-    a: tuple
-    b: tuple
-    count_a: bool = True
-    buffer: int | None = None
-    name: str = "flow shop"
-
-
-@dataclass(frozen=True)
-class AsyncPipe:
-    """Two-stage pipeline across RL iterations (generation of step k+1 runs
-    while step k trains). Returns the steady time per iteration."""
-    producer: "Block"
-    consumer: "Block"
-    name: str = "async"
-
-
-@dataclass(frozen=True)
-class GenBatch:
-    """Generation by a continuous-batching engine, as a closed form over
-    decode steps. All quantities are for ONE replica (one dp x ep index):
-    expansion splits the requests over the replicas, so the evaluator needs
-    no degrees.
-
-    lengths / probs: the response length distribution.
-    comm: collectives per decode step, each sized for ONE sequence.
-    """
-    replica_requests: int        # requests served by one replica
-    prompt_len: float
-    lengths: tuple
-    probs: tuple
-    weight_bytes: float          # per rank, read once per step
-    flops_per_token: float       # per rank
-    kv_bytes_per_token: float    # per rank, per context token
-    kernels_per_step: int
-    max_seqs: int
-    kv_capacity_tokens: float    # per replica
-    comm: tuple = ()
-    prefill: "Block | None" = None
-    name: str = "generate"
-
-
-@dataclass(frozen=True)
-class Call:
-    """One RLHF model call on its device group. Sets the placement used by
-    the collectives inside it, and marks its devices busy for its duration."""
-    name: str
-    body: "Block"
-
-
-Block = Union[Op, Collective, StageP2P, Stream, Transfers, Seq, Par, Repeat, Scale, OnStage,
-              Pipeline, FlowShop2, AsyncPipe, GenBatch, Call]
+def walk(node):
+    """Every node of a tree once, parents before children (shared nodes once)."""
+    seen: set[int] = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        yield n
+        if isinstance(n, (Seq, Par)):
+            stack.extend(reversed(n.children))
+        elif isinstance(n, (Repeat, OnDevices)):
+            stack.append(n.body)
