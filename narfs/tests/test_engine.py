@@ -127,3 +127,13 @@ def test_engine_time_by_replicas_and_flags():
     one, eight = run(Degrees()), run(Degrees(dp=8))
     assert 2 < one / eight < 8                     # 8 replicas share the requests; the tail does not shrink 8x
     assert {"host_step", "reserve", "allreduce_latency"} <= set(EPROF.flags)
+
+
+def test_a_measured_engine_profile_keeps_the_base_paths(tmp_path):
+    f = tmp_path / "vllm-cluster-a.json"
+    f.write_text('{"kind": "engine", "base": "vllm-573f2f9-h100", "values": {'
+                 '"host_step_s": {"value": [0.0008, 4e-06], "kind": "measured", "source": "decode sweep"}}}')
+    prof, lib = load_engine(f)
+    assert prof.host_step == (0.0008, 4e-06) and "host_step" not in prof.flags
+    assert {"reserve", "allreduce_latency"} <= set(prof.flags)
+    assert prof.name == EPROF.name and prof.version == EPROF.version and lib.paths == VLLM.paths

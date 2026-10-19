@@ -97,31 +97,37 @@ _ENGINE_FIELDS = {"max_num_seqs": "max_num_seqs", "max_num_batched_tokens": "max
 
 
 def load_engine(name_or_path, nccl: str = "nccl"):
-    """(EngineProfile, EngineLibrary) from an engine data file in narfs/data."""
-    from narfs.hardware import DATA
+    """(EngineProfile, EngineLibrary) from an engine data file. A file with
+    "base" names another engine file: the values it leaves out, the all-reduce
+    paths included, come from the base, with their flags."""
+    from narfs.hardware import data_path, read_values
     from narfs.network.comm import EngineLibrary, EnginePath
-    path = Path(name_or_path)
-    if not path.suffix:
-        path = DATA / f"{name_or_path}.json"
+    path = data_path(name_or_path)
     d = json.loads(path.read_text())
     if d.get("kind") != "engine":
         raise ValueError(f"{path} is not an engine profile")
-    vals, flags = {}, []
-    for key, entry in d["values"].items():
-        if key == "allreduce_paths":
-            continue
-        v = entry["value"]
-        vals[_ENGINE_FIELDS[key]] = tuple(v) if isinstance(v, list) else v
-        if entry.get("kind") == "assumed":
-            flags.append(_ENGINE_FIELDS[key])
-    ar = d["values"]["allreduce_paths"]
-    if ar.get("latency_kind") == "assumed":
-        flags.append("allreduce_latency")
-    paths = {int(n): tuple(EnginePath(float(b), p, float(lat), bool(inc)) for b, p, lat, inc in rows)
-             for n, rows in ar["value"].items()}
-    prof = EngineProfile(name=d["name"], version=d.get("version", ""), lib=d["name"], flags=tuple(flags), **vals)
-    lib = EngineLibrary(d["name"], paths, nccl=nccl, source=ar.get("source", ""))
-    return prof, lib
+    if "base" in d:
+        prof, lib = load_engine(d["base"], nccl)
+        inherited = {f: getattr(prof, f) for f in _ENGINE_FIELDS.values()}
+        flags, version = list(prof.flags), prof.version
+    else:
+        lib, inherited, flags, version = None, {}, [], ""
+    vals, _, flags = read_values(d, _ENGINE_FIELDS, inherited, flags, skip=("allreduce_paths",))
+    ar = d["values"].get("allreduce_paths")
+    if ar is not None:
+        flags = [f for f in flags if f != "allreduce_latency"]
+        if ar.get("latency_kind") == "assumed":
+            flags.append("allreduce_latency")
+        paths = {int(n): tuple(EnginePath(float(b), p, float(lat), bool(inc)) for b, p, lat, inc in rows)
+                 for n, rows in ar["value"].items()}
+        source = ar.get("source", "")
+    elif lib is not None:
+        paths, source = lib.paths, lib.source
+    else:
+        raise ValueError(f"{path}: no allreduce_paths")
+    name = d.get("name") or (lib.name if lib else path.stem)
+    prof = EngineProfile(name=name, version=d.get("version", version), lib=name, flags=tuple(flags), **vals)
+    return prof, EngineLibrary(name, paths, nccl=nccl, source=source)
 
 
 # the measured vLLM profile on H100 (narfs/data/vllm-573f2f9-h100.json): the default engine

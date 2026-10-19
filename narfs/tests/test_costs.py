@@ -86,3 +86,16 @@ def test_compute_and_host_steps_through_physics():
     k = gemm(4096, 4096, 4096)
     s = evaluate(OnDevices("devs", Seq((Compute(k), Work("host", HostStep("vllm", 100))))), p, bind)
     assert s.lo == pytest.approx(ComputeModel({"h100-sxm": H100_SXM}).time(k, "h100-sxm") + 3e-3)
+
+
+def test_a_measured_profile_overrides_only_what_it_measured(tmp_path):
+    f = tmp_path / "cluster-a.json"
+    f.write_text('{"kind": "gpu", "name": "h100-sxm", "base": "h100-sxm", "values": {'
+                 '"eta_hbm": {"value": 0.91, "kind": "measured", "source": "triad kernel, cluster A"}}}')
+    g = load_gpu(f)
+    assert g.eta_hbm == 0.91 and "eta_hbm" not in g.flags
+    assert g.hbm_bw == H100_SXM.hbm_bw and g.eta_gemm == H100_SXM.eta_gemm
+    assert g.sources["eta_hbm"] == "triad kernel, cluster A" and g.sources["sms"] == H100_SXM.sources["sms"]
+    f.write_text('{"kind": "gpu", "base": "h100-sxm", "values": {"eta_hbn": {"value": 0.9}}}')
+    with pytest.raises(ValueError, match="unknown value 'eta_hbn'"):
+        load_gpu(f)

@@ -59,23 +59,50 @@ _FIELDS = {"sms": "sms", "clock_hz": "clock_hz", "tensor_flops_per_clock_per_sm"
            "launch_eager_s": "launch_eager_s", "graph_node_s": "graph_node_s"}
 
 
-def load_gpu(name_or_path: str | Path) -> GpuProfile:
-    """A GPU profile from a data file: a path, or a name in narfs/data."""
+def data_path(name_or_path: str | Path) -> Path:
+    """A data file: a path, or a name in narfs/data."""
     path = Path(name_or_path)
-    if not path.suffix:
-        path = DATA / f"{name_or_path}.json"
-    d = json.loads(path.read_text())
-    if d.get("kind") != "gpu":
-        raise ValueError(f"{path} is not a GPU profile")
-    vals, sources, flags = {}, {}, []
+    return DATA / f"{name_or_path}.json" if not path.suffix else path
+
+
+def read_values(d: dict, fields: dict, base: dict, flags, skip: tuple = ()) -> tuple[dict, dict, list]:
+    """(values, sources, flags) of a profile file over its base: a value the
+    file gives replaces the base value and its flag; "assumed" values are flagged."""
+    vals, sources, flags = dict(base), {}, list(flags)
     for key, entry in d["values"].items():
-        name = _FIELDS[key]
+        if key in skip:
+            continue
+        if key not in fields:
+            raise ValueError(f"{d.get('name', 'profile')}: unknown value {key!r}; known: {sorted(fields)}")
+        name = fields[key]
         v = entry["value"]
         vals[name] = tuple(v) if isinstance(v, list) else v
         sources[name] = entry.get("source", "")
+        if name in flags:
+            flags.remove(name)
         if entry.get("kind") == "assumed":
             flags.append(name)
-    return GpuProfile(name=d["name"], flags=tuple(flags), sources=sources, **vals)
+    return vals, sources, flags
+
+
+def load_gpu(name_or_path: str | Path) -> GpuProfile:
+    """A GPU profile from a data file. A file with "base" names another
+    profile: the values it leaves out come from the base, with their flags, so
+    a cluster measurement can give only what it measured."""
+    path = data_path(name_or_path)
+    d = json.loads(path.read_text())
+    if d.get("kind") != "gpu":
+        raise ValueError(f"{path} is not a GPU profile")
+    base = load_gpu(d["base"]) if "base" in d else None
+    inherited = {f: getattr(base, f) for f in _FIELDS.values()} if base else {}
+    vals, sources, flags = read_values(d, _FIELDS, inherited, base.flags if base else [])
+    missing = sorted(set(_FIELDS.values()) - set(vals))
+    if missing:
+        raise ValueError(f"{path}: no value for {missing}")
+    if base:
+        sources = {**base.sources, **sources}
+    name = d.get("name") or (base.name if base else path.stem)
+    return GpuProfile(name=name, flags=tuple(flags), sources=sources, **vals)
 
 
 H100_SXM = load_gpu("h100-sxm")
