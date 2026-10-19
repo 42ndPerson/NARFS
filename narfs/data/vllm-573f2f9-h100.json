@@ -1,0 +1,31 @@
+{
+  "kind": "engine",
+  "name": "vllm",
+  "version": "main@573f2f90b52afd45d1fdbb892878422711fcfd62",
+  "gpu": "h100-sxm",
+  "values": {
+    "max_num_seqs": {"value": 256, "kind": "configuration", "source": "vLLM default scheduler setting"},
+    "max_num_batched_tokens": {"value": 8192, "kind": "configuration", "source": "vLLM default token budget per step (chunked prefill)"},
+    "capture_sizes": {"value": [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 264, 272, 280, 288, 296, 304, 312, 320, 328, 336, 344, 352, 360, 368, 376, 384, 392, 400, 408, 416, 424, 432, 440, 448, 456, 464, 472, 480, 488, 496, 504, 512],
+                      "kind": "configuration", "source": "vLLM default CUDA-graph capture sizes: 1, 2, 4, then multiples of 8 up to 512"},
+    "gpu_memory_utilization": {"value": 0.9, "kind": "configuration", "source": "vLLM default"},
+    "host_step_s": {"value": [1.0e-3, 5.0e-6], "kind": "assumed",
+                    "source": "host time per step a + b x batch: unmeasured default; measure with a tiny-model decode batch sweep"},
+    "async_scheduling": {"value": false, "kind": "configuration", "source": "host work in series with the GPU step unless async scheduling is on"},
+    "prefix_caching": {"value": true, "kind": "configuration", "source": "vLLM default: a prompt group's shared prefix is computed and stored once"},
+    "cascade_attention": {"value": false, "kind": "configuration", "source": "shared-prefix KV read once per group only with cascade attention"},
+    "reserve_bytes": {"value": 3.0e9, "kind": "assumed",
+                      "source": "non-torch memory and CUDA graph pool: read from vLLM's startup log ('Available KV cache memory', 'CUDA graph pool memory')"},
+    "allreduce_paths": {
+      "kind": "specification",
+      "source": "vLLM main@573f2f9 on sm 9.0 without FlashInfer: vllm/distributed/device_communicators/{all_reduce_utils.py, custom_all_reduce.py, symm_mem.py, cuda_communicator.py}, csrc/custom_all_reduce.cuh. Per-path latencies are unmeasured defaults.",
+      "latency_kind": "assumed",
+      "value": {
+        "2": [[8388608, "one_shot", 6.0e-6, false], [67108864, "two_shot", 10.0e-6, true]],
+        "4": [[524288, "one_shot", 6.0e-6, false], [8388608, "two_shot", 10.0e-6, false], [33554432, "nvls", 12.0e-6, true]],
+        "6": [[262144, "one_shot", 6.0e-6, false], [524288, "two_shot", 10.0e-6, false], [67108864, "nvls", 12.0e-6, true]],
+        "8": [[262144, "one_shot", 6.0e-6, false], [67108864, "nvls", 12.0e-6, true]]
+      }
+    }
+  }
+}
