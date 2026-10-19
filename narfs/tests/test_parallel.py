@@ -91,6 +91,14 @@ def test_reshard_experts_over_ep():
     assert got == pytest.approx({4: 16.0, 5: 16.0})              # half of 2 x 16 expert bytes each
 
 
+def test_reshard_experts_into_an_engine_that_shards_them_over_tp():
+    lay = ParamLayout(layers=((0.0, 0.0, 16.0),) * 2, expert_tp=True)
+    a = map_devices(range(4), Degrees(ep=4))
+    b = map_devices(range(4, 8), Degrees(tp=4))                  # ep 1: each tp rank holds 1/4 of every expert
+    got = _received(reshard_pairs(lay, a, b))
+    assert got == pytest.approx({d: 2 * 16.0 / 4 for d in range(4, 8)})
+
+
 def test_binder_contract_and_hosts():
     pl = map_devices(range(16), Degrees(dp=2, tp=8))
     b = Binder({"gen": pl}, host_ids=lambda d: 1000 + d)

@@ -77,5 +77,5 @@ def lower_generate(call: str, arch: Architecture, deg: Degrees, eprof: EnginePro
     if info.get("tail") in ("gpd", "exp"):
         share = max(0.0, 1.0 - info["u"] / traj.end) if traj.end else 0.0
         tail = f"; fitted tail above u = {info['u']} (beta {info['beta']:.0f}, xi {info['xi']:.2f}) sets {share:.0%} of the steps"
-    name = f"generate: {traj.end:.0f} decode steps, {C} slots x {replicas} replicas{tail}"
+    name = f"generate: {traj.end:.0f} decode steps, {traj.first} slots x {replicas} replicas{tail}"
     return OnDevices(Devices(call), Seq((prefill, Seq(tuple(decode), name="decode")), name=name), name=call)

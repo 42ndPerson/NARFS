@@ -37,6 +37,13 @@ class Physics:
         self.n_resources = topo.n_resources
         self._last: dict = {}
 
+    def trim(self) -> None:
+        """Bound the unit table between evaluations; the communication model's
+        group facts hold unit ids, so they go with it."""
+        if self.units.trim():
+            self.comm.clear()
+        self._last.clear()
+
     def _bound(self, binding, handle):
         try:
             return binding[handle]

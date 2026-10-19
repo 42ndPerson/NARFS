@@ -113,6 +113,10 @@ class CommModel:
         self.libraries = dict(libraries)
         self._groups: dict = {}
 
+    def clear(self) -> None:
+        """Forget the group facts (after the unit table is trimmed)."""
+        self._groups.clear()
+
     def group(self, bound: np.ndarray) -> _Group:
         hit = self._groups.get(id(bound))
         if hit is not None and hit[0] is bound:

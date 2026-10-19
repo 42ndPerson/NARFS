@@ -237,8 +237,11 @@ class UnitTable:
     def unit(self, uid: int):
         return self._units[uid]
 
-    def trim(self) -> None:
-        """Forget every unit (call between evaluations when the table is large)."""
-        if len(self._units) > self.limit:
-            self._ids.clear()
-            self._units.clear()
+    def trim(self) -> bool:
+        """Forget every unit when the table is large (between evaluations
+        only). True when it did: callers drop the unit ids they cache."""
+        if len(self._units) <= self.limit:
+            return False
+        self._ids.clear()
+        self._units.clear()
+        return True

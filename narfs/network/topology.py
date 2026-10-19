@@ -60,6 +60,9 @@ class Topology:
     def __init__(self, *, gpu_class, scaleup, nvl_rate, nic_rate, pcie_rate, tiers=(),
                  nvls=False, nvls_level=1.0, pools=None, nvl_latency=0.0, net_latency=0.0,
                  node_of=None):
+        self._args = dict(gpu_class=gpu_class, scaleup=scaleup, nvl_rate=nvl_rate, nic_rate=nic_rate,
+                          pcie_rate=pcie_rate, tiers=tiers, nvls=nvls, nvls_level=nvls_level, pools=pools,
+                          nvl_latency=nvl_latency, net_latency=net_latency, node_of=node_of)
         self.gpu_class = tuple(gpu_class)
         G = self.n_gpus = len(self.gpu_class)
         self.scaleup = np.asarray(scaleup, dtype=np.int64)
@@ -105,6 +108,15 @@ class Topology:
             raise ValueError("every capacity must be > 0")
         cap.setflags(write=False)
         self.cap = cap
+
+    def with_pools(self, pools: dict) -> "Topology":
+        """The same cluster with more CPU pools (name -> workers)."""
+        merged = dict(self._args["pools"] or {})
+        for name, workers in pools.items():
+            if name in merged and merged[name] != workers:
+                raise ValueError(f"CPU pool {name!r} declared with {merged[name]} and {workers} workers")
+            merged[name] = workers
+        return Topology(**{**self._args, "pools": merged})
 
     # ------------------------------------------------------------- ids ---
     def rid(self, family: str, gpus) -> np.ndarray:

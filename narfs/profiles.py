@@ -122,3 +122,7 @@ def load_engine(name_or_path, nccl: str = "nccl"):
     prof = EngineProfile(name=d["name"], version=d.get("version", ""), lib=d["name"], flags=tuple(flags), **vals)
     lib = EngineLibrary(d["name"], paths, nccl=nccl, source=ar.get("source", ""))
     return prof, lib
+
+
+# the measured vLLM profile on H100 (narfs/data/vllm-573f2f9-h100.json): the default engine
+VLLM_H100, VLLM_H100_LIBRARY = load_engine("vllm-573f2f9-h100")

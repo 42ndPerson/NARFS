@@ -22,14 +22,17 @@ from narfs.parallel.mesh import Placement, stage_split
 class ParamLayout:
     """A model's parameter bytes by sharding class, as one reshard moves them.
 
-    layers  per layer, full-model bytes: (sharded over tp, replicated,
-            sharded over ep)
-    embed   input embedding bytes (first stage, vocab-sharded over tp)
-    head    output head bytes (last stage, vocab-sharded over tp)
+    layers     per layer, full-model bytes: (sharded over tp, replicated,
+               sharded over ep)
+    embed      input embedding bytes (first stage, vocab-sharded over tp)
+    head       output head bytes (last stage, vocab-sharded over tp)
+    expert_tp  the destination also shards the routed experts over tp (an
+               inference engine without expert parallelism does)
     """
     layers: tuple
     embed: float = 0.0
     head: float = 0.0
+    expert_tp: bool = False
 
     @property
     def total(self) -> float:
@@ -88,7 +91,7 @@ def reshard_pairs(layout: ParamLayout, src: Placement, dst: Placement):
                         f = _overlap(ed, Dd.ep, es, Ds.ep)
                         if f > 0:
                             s_dev = src.dev_of[np.arange(Dd.dp)[:, None, None] % Ds.dp, ss, es, 0, tp % Ds.tp]
-                            _push(srcs, dsts, sizes, s_dev, d_dev, p_ep * f)
+                            _push(srcs, dsts, sizes, s_dev, d_dev, p_ep * f / (Dd.tp if layout.expert_tp else 1))
     if not srcs:
         z = np.zeros(0, dtype=np.int64)
         return z, z, np.zeros(0)
