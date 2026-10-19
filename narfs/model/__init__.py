@@ -1,1 +1,1 @@
-"""Architecture descriptions (mostly data) and the component library."""
+"""Model definitions (data) and the component library (L3)."""

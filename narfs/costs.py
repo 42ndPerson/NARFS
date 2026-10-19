@@ -47,6 +47,7 @@ class Kernel:
     dtype: str = "bf16"
     tiles: float = 0.0
     tensor: bool = False
+    groups: float = 1.0                # a grouped GEMM: `groups` GEMMs of `shape` in one kernel
     name: str = ""
 
     def __post_init__(self) -> None:
@@ -56,11 +57,14 @@ class Kernel:
             raise ValueError("kernel flops and bytes must be >= 0")
 
 
-def gemm(m: float, n: float, k: float, dtype: str = "bf16", name: str = "", out_dtype: str | None = None) -> Kernel:
-    """C[m, n] = A[m, k] x B[k, n]: reads A and B once and writes C."""
+def gemm(m: float, n: float, k: float, dtype: str = "bf16", name: str = "", out_dtype: str | None = None,
+         groups: float = 1.0) -> Kernel:
+    """C[m, n] = A[m, k] x B[k, n]: reads A and B once and writes C. With
+    `groups`, a grouped GEMM (for example one per local expert) in one kernel."""
     b = DTYPE_BYTES[dtype]
     bo = DTYPE_BYTES[out_dtype or ("bf16" if dtype == "fp8" else dtype)]
-    return Kernel("gemm", 2.0 * m * n * k, b * (m * k + k * n) + bo * m * n, (m, n, k), dtype, name=name)
+    return Kernel("gemm", 2.0 * m * n * k * groups, groups * (b * (m * k + k * n) + bo * m * n), (m, n, k), dtype,
+                  groups=groups, name=name)
 
 
 def elementwise(flops: float, bytes_: float, name: str = "") -> Kernel:
@@ -112,12 +116,12 @@ class ComputeModel:
         if w.kind == "gemm":
             m, n, k = w.shape
             tm, tn = g.tile
-            tiles = math.ceil(m / tm) * math.ceil(n / tn)
+            tiles = math.ceil(w.groups * math.ceil(m / tm) * math.ceil(n / tn))
             # skinny outputs cannot fill the SMs: the K loop is split across SMs (split-K);
             # the fp32 partial sums are small next to the weights and mostly stay in L2
             split = max(1, min(g.sms // tiles, math.ceil(k / SPLIT_K_BLOCK))) if 0 < tiles < g.sms else 1
             nw, u = waves(tiles * split, g.sms)
-            padded = 2.0 * math.ceil(m / tm) * tm * math.ceil(n / tn) * tn * k
+            padded = 2.0 * w.groups * math.ceil(m / tm) * tm * math.ceil(n / tn) * tn * k
             compute = padded / (g.eta(w.dtype) * g.peak(w.dtype) * u) if tiles else 0.0
         elif w.kind == "attention" or (w.kind == "op" and w.tensor):
             nw, u = waves(w.tiles, g.sms) if w.tiles else (0, 1.0)
