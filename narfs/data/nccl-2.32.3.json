@@ -1,0 +1,53 @@
+{
+  "kind": "nccl",
+  "version": "2.32.3",
+  "source": "NVIDIA/nccl at commit 3e46c089f4ae4732722a419eb6096aead7e47a30: src/tuning/cost_model.cc (ncclTunerConstantsDefaults), ring.cc, tree.cc, nvls.cc, tuning_general.cc; read 2026-10-19",
+  "units": "microseconds; protocols in the order LL, LL128, Simple",
+  "base": {
+    "Tree": [6.8, 14.0, 8.4],
+    "Ring": [6.6, 14.0, 8.4],
+    "CollNetDirect": [0, 0, 0],
+    "CollNetChain": [0, 0, 0],
+    "NVLS": [0, 0, 0],
+    "NVLSTree": [0, 0, 0],
+    "PAT": [8.0, 8.0, 8.0]
+  },
+  "hw": {
+    "NVLINK": {
+      "Tree": [0.6, 1.25, 4.0],
+      "Ring": [0.6, 1.9, 3.4],
+      "CollNetDirect": [0, 0, 3.7],
+      "CollNetChain": [0, 0, 2.8],
+      "NVLS": [0, 0, 25],
+      "NVLSTree": [0, 0, 25],
+      "PAT": [0, 0, 4.0]
+    },
+    "PCI": {
+      "Tree": [1.0, 1.9, 4.0],
+      "Ring": [1.0, 2.5, 5.7],
+      "CollNetDirect": [0, 0, 3.7],
+      "CollNetChain": [0, 0, 2.8],
+      "NVLS": [0, 0, 0],
+      "NVLSTree": [0, 0, 0],
+      "PAT": [0, 0, 4.0]
+    },
+    "NET": {
+      "Tree": [5.0, 8.5, 14],
+      "Ring": [2.7, 4.0, 14.0],
+      "CollNetDirect": [0, 0, 31],
+      "CollNetChain": [0, 0, 30],
+      "NVLS": [0, 0, 18],
+      "NVLSTree": [0, 0, 20.9],
+      "PAT": [0, 0, 14]
+    }
+  },
+  "net_overhead": {"intel": 1.0, "amd": 2.0},
+  "plateau": {"ampere_and_later": 1.4, "before_ampere": 1.9},
+  "ll_max_bw_GBps": {
+    "hopper_1_node": 141.0,
+    "intel_2_nodes": 39.0,
+    "intel_4_nodes": 20.4,
+    "amd_2_nodes": 22.5,
+    "amd_4_nodes": 19.0
+  }
+}

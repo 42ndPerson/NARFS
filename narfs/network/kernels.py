@@ -1,195 +1,244 @@
 """Array kernels for the network: the only array-style code in the project.
 
-Every kernel is a pure function. It takes integer device arrays and a byte
-size, and returns a new demand vector over the cluster's resource index.
-A kernel handles all instances of one collective class in one call, so the
-cost grows with the number of member devices, never with device pairs.
+Each pattern function takes a topology and a group array of shape
+[instances, members] (all instances run at once), and returns the bytes on
+each resource per byte of the collective's size S, aggregated as
+(unique resource ids, bytes). Costs grow with members x tiers, never with
+device pairs.
 
-`groups` is always an int array of shape [n_instances, group_size]: row i
-holds the device IDs of collective instance i.
+Each pattern also has a `*_flows` twin that lists the point-to-point flows
+(src, dst, bytes per byte of S). Tests check that routing the flows gives the
+pattern, and the flow-level validation tier uses the flows.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from narfs.network.topology import Cluster
+from narfs.network.topology import Topology, aggregate
 
 
-# ---------------------------------------------------------------- helpers ---
+# ------------------------------------------------------------ helpers ---
 
-def instance_shape(groups: np.ndarray, net: Cluster):
-    """Shape of every instance on the hierarchy, in one pass.
-
-    Returns (g, k, spans):
-      g      [n_inst, size]  members of the same instance on each member's node
-      k      [n_inst, 1]     distinct nodes in each instance
-      spans  [n_inst, 1]     True if the instance uses more than one leaf switch
-    """
-    n_inst, size = groups.shape
-    inst = np.repeat(np.arange(n_inst), size)
-    node_key = inst * net.nodes + net.node_of[groups.ravel()]
-    per_node = np.bincount(node_key, minlength=n_inst * net.nodes)
-    g = per_node[node_key].reshape(n_inst, size)
-    k = np.count_nonzero(per_node.reshape(n_inst, net.nodes), axis=1).reshape(n_inst, 1)
-    leaf_key = inst * net.n_leaves + net.leaf_of[groups.ravel()]
-    per_leaf = np.bincount(leaf_key, minlength=n_inst * net.n_leaves).reshape(n_inst, net.n_leaves)
-    spans = (np.count_nonzero(per_leaf, axis=1) > 1).reshape(n_inst, 1)
-    return g, k, spans
+def _runs(sorted_keys: np.ndarray):
+    """Run starts, run ids per element, local index and run size per element,
+    for a flat array where equal keys are contiguous."""
+    n = sorted_keys.size
+    new = np.ones(n, dtype=bool)
+    new[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    starts = np.flatnonzero(new)
+    run_id = np.cumsum(new) - 1
+    size = np.diff(np.append(starts, n))
+    local = np.arange(n) - starts[run_id]
+    return starts, run_id, local, size
 
 
-def members_per_node(groups: np.ndarray, net: Cluster) -> np.ndarray:
-    """For each member: how many members of its instance are on its node."""
-    return instance_shape(groups, net)[0]
+def ring_order(topo: Topology, groups: np.ndarray) -> np.ndarray:
+    """Members of each instance in ring order: members of one scale-up domain
+    are contiguous, and domains follow their lowest member's scale-out keys
+    (top tier first), so a ring crosses each tier as few times as it can."""
+    I, n = groups.shape
+    flat = groups.ravel()
+    inst = np.repeat(np.arange(I), n)
+    dom = topo.scaleup[flat]
+    key = inst * topo.n_scaleup + dom
+    order = np.lexsort((flat, key))
+    starts, run_id, _, _ = _runs(key[order])
+    low = np.empty_like(flat)
+    low[order] = flat[order][starts][run_id]               # lowest member of each (instance, domain)
+    keys = [flat, dom] + [t.key[low] for t in topo.tiers] + [inst]
+    return flat[np.lexsort(tuple(keys))].reshape(I, n)
 
 
-def nodes_per_instance(groups: np.ndarray, net: Cluster) -> np.ndarray:
-    """For each instance: how many distinct nodes it spans. Shape [n_inst, 1]."""
-    return instance_shape(groups, net)[1]
+def _ring_layout(topo: Topology, groups: np.ndarray):
+    ring = ring_order(topo, groups)
+    I, n = ring.shape
+    flat = ring.ravel()
+    inst = np.repeat(np.arange(I), n)
+    key = inst * topo.n_scaleup + topo.scaleup[flat]
+    starts, run_id, local, size = _runs(key)
+    run_inst = inst[starts]
+    runs_per_inst = np.bincount(run_inst, minlength=I)
+    channels = int(size.max())
+    return ring, flat, starts, run_id, local, size, run_inst, runs_per_inst, channels
 
 
-def _member_demand(groups: np.ndarray, intra: np.ndarray, inter: np.ndarray,
-                   spans: np.ndarray, net: Cluster) -> np.ndarray:
-    """One accumulation for all member traffic of a collective class:
-    `intra` bytes each way over NVLink, `inter` bytes each way over the NIC
-    and the member's leaf, and the spine for instances that span leaves."""
-    leaf = net.leaf_of[groups]
-    ids = np.concatenate([(net.NVL_TX + groups).ravel(), (net.NVL_RX + groups).ravel(),
-                          (net.NIC_TX + groups).ravel(), (net.NIC_RX + groups).ravel(),
-                          (net.LEAF_UP + leaf).ravel(), (net.LEAF_DOWN + leaf).ravel()])
-    intra = np.broadcast_to(intra, groups.shape).ravel()
-    inter = np.broadcast_to(inter, groups.shape).ravel()
-    vals = np.concatenate([intra, intra, inter, inter, inter, inter])
-    demand = np.bincount(ids, weights=vals, minlength=net.n_resources)
-    demand[net.SPINE] += float((np.broadcast_to(inter.reshape(groups.shape) * spans, groups.shape)).sum())
-    return demand
+# ------------------------------------------------------------ patterns ---
+
+def ring(topo: Topology, groups: np.ndarray, factor: float):
+    """A ring collective that moves `factor` x S over every ring edge
+    (2(n-1)/n for all-reduce, (n-1)/n for all-gather and reduce-scatter).
+
+    Each ring channel uses one rail. With C channels, channel c enters and
+    leaves every domain through the domain's member at local index c mod g, and
+    goes around the domain's members over NVLink in between. So the NIC bytes
+    of a domain are spread over its members, and on a rail-optimized fabric a
+    channel's inter-node bytes stay on one rail, as NCCL's rings do."""
+    ring_, flat, starts, run_id, local, size, run_inst, k, C = _ring_layout(topo, groups)
+    g = size[run_id]
+    nvl = np.where(g > 1, float(factor), 0.0)
+    ids = [topo.off["nvl_tx"] + flat, topo.off["nvl_rx"] + flat]
+    ws = [nvl, nvl]
+    src, dst = _crossings(starts, size, run_inst, k, flat, C)
+    if src.size:
+        cid, cw = topo.pair_demand(src, dst, factor / C)
+        ids.append(cid)
+        ws.append(cw)
+    return aggregate(np.concatenate(ids), np.concatenate(ws), topo.n_resources)
 
 
-def add_to(demand: np.ndarray, ids: np.ndarray, values: np.ndarray | float) -> None:
-    """demand[ids] += values, with repeated ids accumulated."""
-    np.add.at(demand, np.asarray(ids).ravel(), np.broadcast_to(values, np.shape(ids)).ravel())
+def _next_runs(run_inst: np.ndarray) -> np.ndarray:
+    R = run_inst.size
+    nxt = np.arange(1, R + 1)
+    first = np.r_[0, np.flatnonzero(np.diff(run_inst)) + 1]            # first run of each instance
+    last = np.r_[first[1:] - 1, R - 1]
+    nxt[last] = first
+    return nxt
 
 
-# ---------------------------------------------------------- collectives ---
-
-def allreduce_demand(groups: np.ndarray, size: float, net: Cluster) -> np.ndarray:
-    """Hierarchical all-reduce of `size` bytes per rank, for every instance.
-
-    Per member, with g = members on its node and k = nodes in its instance:
-      NVLink (each direction): 2(g-1)/g * size     intra-node reduce-scatter + all-gather
-      NIC    (each direction): 2(k-1)/k * size/g   inter-node ring on a 1/g shard
-    """
-    g, k, spans = instance_shape(groups, net)
-    intra = 2.0 * (g - 1) / g * size
-    inter = np.where(k > 1, 2.0 * (k - 1) / k * size / g, 0.0)
-    return _member_demand(groups, intra, inter, spans, net)
-
-
-def allgather_demand(groups: np.ndarray, size: float, net: Cluster) -> np.ndarray:
-    """Hierarchical all-gather (or reduce-scatter) with `size` = full tensor
-    bytes per rank. Half the traffic of an all-reduce of the same size."""
-    g, k, spans = instance_shape(groups, net)
-    intra = (g - 1) / g * size
-    inter = np.where(k > 1, (k - 1) / k * size / g, 0.0)
-    return _member_demand(groups, intra, inter, spans, net)
+def _crossings(starts, size, run_inst, k, flat, C):
+    """(member leaving a domain, member entering the next one) for every
+    channel of every multi-domain instance."""
+    multi = k[run_inst] > 1
+    if not multi.any():
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    nxt = _next_runs(run_inst)
+    sel = np.flatnonzero(multi)
+    c = np.arange(C)
+    src = starts[sel, None] + c[None, :] % size[sel, None]
+    nx = nxt[sel]
+    dst = starts[nx, None] + c[None, :] % size[nx, None]
+    return flat[src.ravel()], flat[dst.ravel()]
 
 
-reducescatter_demand = allgather_demand
+def ring_flows(topo: Topology, groups: np.ndarray, factor: float):
+    """The ring's flows, channel by channel (for tests and validation)."""
+    ring_, flat, starts, run_id, local, size, run_inst, k, C = _ring_layout(topo, groups)
+    per = factor / C
+    srcs, dsts = [], []
+    for i in range(ring_.shape[0]):
+        runs = np.flatnonzero(run_inst == i)
+        for c in range(C):
+            for a, r in enumerate(runs):
+                m = flat[starts[r]:starts[r] + size[r]]
+                g = size[r]
+                if g > 1:                                                # once around the domain over NVLink
+                    srcs += list(m)
+                    dsts += list(np.roll(m, -1))
+                if k[i] > 1:                                             # then on to the next domain, one rail
+                    r2 = runs[(a + 1) % len(runs)]
+                    m2 = flat[starts[r2]:starts[r2] + size[r2]]
+                    srcs.append(m[c % g])
+                    dsts.append(m2[c % size[r2]])
+    return np.array(srcs), np.array(dsts), np.full(len(srcs), per)
 
 
-def alltoall_demand(groups: np.ndarray, size: float, net: Cluster) -> np.ndarray:
-    """All-to-all where each member sends `size` bytes in total, split evenly
-    over all members (its own share stays local).
-
-      to members on the same node:   (g_node - 1)/G * size over NVLink
-      to members on other nodes:     (G - g_node)/G * size over NIC and leaf
-    """
-    G = groups.shape[1]
-    g, _, spans = instance_shape(groups, net)
-    intra = (g - 1) / G * size
-    inter = (G - g) / G * size
-    return _member_demand(groups, intra, inter, spans, net)
+def _members(topo: Topology, groups: np.ndarray, per_member: float):
+    flat = groups.ravel()
+    ids = np.concatenate([topo.off["nvl_tx"] + flat, topo.off["nvl_rx"] + flat])
+    return aggregate(ids, np.full(ids.size, float(per_member)), topo.n_resources)
 
 
-def p2p_demand(src: np.ndarray, dst: np.ndarray, size: np.ndarray | float, net: Cluster) -> np.ndarray:
-    """Point-to-point transfers src[i] -> dst[i] of size[i] bytes."""
-    demand = net.zeros()
-    src = np.asarray(src).ravel()
-    dst = np.asarray(dst).ravel()
-    size = np.broadcast_to(np.asarray(size, dtype=float), src.shape)
-    moving = src != dst
-    same_node = (net.node_of[src] == net.node_of[dst]) & moving
-    cross = moving & ~same_node
-    add_to(demand, net.NVL_TX + src[same_node], size[same_node])
-    add_to(demand, net.NVL_RX + dst[same_node], size[same_node])
-    s, d, b = src[cross], dst[cross], size[cross]
-    add_to(demand, net.NIC_TX + s, b)
-    add_to(demand, net.NIC_RX + d, b)
-    add_to(demand, net.LEAF_UP + net.leaf_of[s], b)
-    add_to(demand, net.LEAF_DOWN + net.leaf_of[d], b)
-    demand[net.SPINE] += float(b[net.leaf_of[s] != net.leaf_of[d]].sum())
-    return demand
+def one_shot(topo: Topology, groups: np.ndarray):
+    """Each member reads the whole buffer from every peer: (n-1) x S each way.
+    Inside one scale-up domain only."""
+    return _members(topo, groups, groups.shape[1] - 1)
 
 
-def stream_demand(devices: np.ndarray, size: float, net: Cluster, kind: str = "pcie") -> np.ndarray:
-    """A steady stream of `size` bytes per device over a per-device resource."""
-    if kind != "pcie":
-        raise ValueError(f"unknown stream kind {kind!r}")
-    demand = net.zeros()
-    add_to(demand, net.PCIE + np.asarray(devices), size)
-    return demand
+def one_shot_flows(topo: Topology, groups: np.ndarray):
+    return _all_pairs(groups, 1.0)
 
 
-# ------------------------------------------------------------------ times ---
-
-def burst_time(demand: np.ndarray, net: Cluster) -> float:
-    """Time for a lockstep burst: the most loaded resource sets the time.
-    All instances of a class run at the same instant, so their bytes share
-    each resource."""
-    return float((demand / net.cap).max())
+def two_shot(topo: Topology, groups: np.ndarray):
+    """Reduce-scatter then all-gather by direct loads: 2(n-1)/n x S each way."""
+    n = groups.shape[1]
+    return _members(topo, groups, 2.0 * (n - 1) / n)
 
 
-def steps_latency(kind: str, groups: np.ndarray, net: Cluster) -> float:
-    """Latency term: number of algorithm steps times the per-step latency of
-    the slowest level used."""
-    g, k, _ = instance_shape(groups, net)
-    g_max, k_max = int(g.max()), int(k.max())
-    if kind == "allreduce":
-        intra, inter = 2 * (g_max - 1), 2 * (k_max - 1)
-    elif kind in ("allgather", "reducescatter"):
-        intra, inter = g_max - 1, k_max - 1
-    elif kind == "alltoall":
-        intra, inter = (1 if g_max > 1 else 0), (1 if k_max > 1 else 0)
-    else:
-        raise ValueError(f"unknown collective kind {kind!r}")
-    return intra * net.nvlink_alpha + inter * net.nic_alpha
+def two_shot_flows(topo: Topology, groups: np.ndarray):
+    return _all_pairs(groups, 2.0 / groups.shape[1])
 
 
-def collective(kind: str, groups: np.ndarray, size: float, net: Cluster) -> tuple[np.ndarray, float]:
-    """Demand vector and latency term of one collective class, computing the
-    instance shapes once. This is the entry point the evaluator uses."""
-    g, k, spans = instance_shape(groups, net)
-    G = groups.shape[1]
-    if kind == "allreduce":
-        intra = 2.0 * (g - 1) / g * size
-        inter = np.where(k > 1, 2.0 * (k - 1) / k * size / g, 0.0)
-        steps_intra, steps_inter = 2 * (g.max() - 1), 2 * (k.max() - 1)
-    elif kind in ("allgather", "reducescatter"):
-        intra = (g - 1) / g * size
-        inter = np.where(k > 1, (k - 1) / k * size / g, 0.0)
-        steps_intra, steps_inter = g.max() - 1, k.max() - 1
-    elif kind == "alltoall":
-        intra = (g - 1) / G * size
-        inter = (G - g) / G * size
-        steps_intra, steps_inter = int(g.max() > 1), int(k.max() > 1)
-    else:
-        raise ValueError(f"unknown collective kind {kind!r}")
-    latency = float(steps_intra * net.nvlink_alpha + steps_inter * net.nic_alpha)
-    return _member_demand(groups, intra, inter, spans, net), latency
+def nvls(topo: Topology, groups: np.ndarray):
+    """In-switch reduction: each port carries S(1 + 1/n) each way, divided by
+    the domain's NVLS level (applied like a protocol payload factor)."""
+    n = groups.shape[1]
+    flat = groups.ravel()
+    level = topo.nvls_level[topo.scaleup[flat]]
+    per = (1.0 + 1.0 / n) / level
+    ids = np.concatenate([topo.off["nvl_tx"] + flat, topo.off["nvl_rx"] + flat])
+    return aggregate(ids, np.concatenate([per, per]), topo.n_resources)
 
 
-DEMAND_KERNELS = {
-    "allreduce": allreduce_demand,
-    "allgather": allgather_demand,
-    "reducescatter": reducescatter_demand,
-    "alltoall": alltoall_demand,
-}
+def spread(topo: Topology, groups: np.ndarray):
+    """Uniform all-to-all: each member sends S/n to every member (its own share
+    stays local). Uses domain counts, so the cost is O(members x tiers).
+    Assumes nested scale-out tiers."""
+    I, n = groups.shape
+    flat = groups.ravel()
+    inst = np.repeat(np.arange(I), n)
+
+    def count(key):
+        _, inv, cnt = np.unique(inst * (key.max() + 1) + key, return_inverse=True, return_counts=True)
+        return cnt[inv]
+
+    dom = topo.scaleup[flat]
+    g = count(dom)
+    ids = [topo.off["nvl_tx"] + flat, topo.off["nvl_rx"] + flat,
+           topo.off["nic_tx"] + flat, topo.off["nic_rx"] + flat]
+    near, far = (g - 1) / n, (n - g) / n
+    ws = [near, near, far, far]
+    for t, u, d in zip(topo.tiers, topo.up_off, topo.down_off):
+        tk = t.key[flat]
+        c = count(tk)
+        both = count(dom * (tk.max() + 1) + tk)
+        out = (n - g - c + both) / n                       # peers outside both the domain and the tier domain
+        ids += [u + tk, d + tk]
+        ws += [out, out]
+    ws = [np.broadcast_to(w, flat.shape) for w in ws]
+    return aggregate(np.concatenate(ids), np.concatenate(ws), topo.n_resources)
+
+
+def spread_flows(topo: Topology, groups: np.ndarray):
+    return _all_pairs(groups, 1.0 / groups.shape[1])
+
+
+def _all_pairs(groups: np.ndarray, per: float):
+    I, n = groups.shape
+    a = np.repeat(groups, n, axis=1).ravel()
+    b = np.tile(groups, (1, n)).ravel()
+    keep = a != b
+    return a[keep], b[keep], np.full(int(keep.sum()), per)
+
+
+# ------------------------------------------------------------- units ---
+
+class UnitTable:
+    """Interned demand vectors. A unit is (resource ids, seconds of use per
+    unit amount); its id is what the evaluator's demand maps hold. Units are
+    keyed by content, so they are shared across candidates."""
+
+    def __init__(self, cap: np.ndarray, limit: int = 200_000):
+        self.cap = cap
+        self.limit = limit
+        self._ids: dict = {}
+        self._units: list = []
+
+    def __len__(self) -> int:
+        return len(self._units)
+
+    def intern(self, key, build) -> int:
+        uid = self._ids.get(key)
+        if uid is None:
+            ids, amount = build()
+            uid = self._ids[key] = len(self._units)
+            self._units.append((np.asarray(ids, dtype=np.int64), np.asarray(amount, dtype=float) / self.cap[ids]))
+        return uid
+
+    def unit(self, uid: int):
+        return self._units[uid]
+
+    def trim(self) -> None:
+        """Forget every unit (call between evaluations when the table is large)."""
+        if len(self._units) > self.limit:
+            self._ids.clear()
+            self._units.clear()
