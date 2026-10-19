@@ -1,12 +1,12 @@
-"""Level 3: mesh axes on devices.
+"""L2: mesh degrees, device mapping and the stage split.
 
-A Placement is an integer array: mesh coordinate -> device ID. The axes are
-always stored in the canonical order AXES; `order` only decides which axis
-varies fastest when devices are assigned from a list.
+A Placement is an integer array: mesh coordinate -> device id, stored in the
+canonical axis order AXES. `order` only decides which axis varies fastest when
+devices are assigned from a list, and any device list is allowed, so irregular
+layouts work.
 
-Data: EP ranks hold different data, as in Megatron-Core and in DP + EP
-inference engines. So the data replicas are dp x ep, and the replicas of a
-non-expert parameter are the (dp, ep) groups.
+Data replicas are dp x ep: EP ranks hold different data, as in Megatron-Core
+and in DP + EP inference engines.
 """
 from __future__ import annotations
 
@@ -32,17 +32,14 @@ class Degrees:
 
     @property
     def size(self) -> int:
-        out = 1
-        for a in AXES:
-            out *= getattr(self, a)
-        return out
+        return self.of(AXES)
 
-    def of(self, axis: str | tuple) -> int:
+    def of(self, axes) -> int:
         """Degree of one axis, or the product for a tuple of axes."""
-        if isinstance(axis, str):
-            return getattr(self, axis)
+        if isinstance(axes, str):
+            return getattr(self, axes)
         out = 1
-        for a in axis:
+        for a in axes:
             out *= getattr(self, a)
         return out
 
@@ -58,11 +55,11 @@ class Degrees:
 @dataclass(frozen=True)
 class Placement:
     degrees: Degrees
-    dev_of: np.ndarray = field(compare=False, repr=False)   # shape = degrees.shape()
+    dev_of: np.ndarray = field(compare=False, repr=False)       # shape = degrees.shape()
 
     def __post_init__(self) -> None:
         if self.dev_of.shape != self.degrees.shape():
-            raise ValueError(f"dev_of shape {self.dev_of.shape} does not match degrees {self.degrees.shape()}")
+            raise ValueError(f"device array shape {self.dev_of.shape} does not match degrees {self.degrees.shape()}")
         if len(np.unique(self.dev_of)) != self.dev_of.size:
             raise ValueError("a device appears twice in one placement")
 
@@ -70,11 +67,14 @@ class Placement:
     def devices(self) -> np.ndarray:
         return self.dev_of.ravel()
 
-    def groups(self, axis: str | tuple, stage: int | None = None) -> np.ndarray:
-        """[n_instances, degree] device IDs of every instance along `axis`
-        (one axis, or a tuple of axes that form one group). With `stage`,
-        only the instances inside that PP stage."""
-        axes = (axis,) if isinstance(axis, str) else tuple(axis)
+    def stage_devices(self, stage: int) -> np.ndarray:
+        return self.dev_of[:, stage].ravel()
+
+    def groups(self, axes, stage: int | None = None) -> np.ndarray:
+        """[instances, members]: the devices of every instance along `axes` (one
+        axis, or a tuple that forms one group). With `stage`, only the instances
+        inside that PP stage."""
+        axes = (axes,) if isinstance(axes, str) else tuple(axes)
         idx = [AXES.index(a) for a in axes]
         arr = self.dev_of
         if stage is not None and "pp" not in axes:
@@ -83,30 +83,32 @@ class Placement:
         size = 1
         for i in idx:
             size *= arr.shape[i]
-        return moved.reshape(-1, size)
-
-    def stage_devices(self, stage: int) -> np.ndarray:
-        return self.dev_of[:, stage].ravel()
-
-    def pp_pairs(self) -> tuple[np.ndarray, np.ndarray]:
-        """Sources and destinations of every stage s -> s+1 activation send."""
-        src = self.dev_of[:, :-1].ravel()
-        dst = self.dev_of[:, 1:].ravel()
-        return src, dst
+        return np.ascontiguousarray(moved.reshape(-1, size))
 
 
 def map_devices(devices, degrees: Degrees, order: tuple = AXES) -> Placement:
-    """Assign `devices` (in the given list order) to mesh coordinates.
-
-    `order` lists the axes from slowest to fastest varying. The default puts
-    tp innermost, so consecutive devices (usually on one node) form TP groups.
-    Any list of devices is allowed, which supports irregular layouts.
-    """
+    """Assign `devices`, in list order, to mesh coordinates. `order` lists the
+    axes from slowest to fastest varying; the default puts tp innermost, so
+    consecutive devices (usually one node) form the TP groups."""
     devices = np.asarray(devices, dtype=np.int64)
     if devices.size != degrees.size:
-        raise ValueError(f"placement needs {degrees.size} devices, got {devices.size}")
+        raise ValueError(f"degrees {degrees.shape()} need {degrees.size} devices, got {devices.size}")
     if sorted(order) != sorted(AXES):
         raise ValueError(f"order must be a permutation of {AXES}")
     shaped = devices.reshape([degrees.of(a) for a in order])
     perm = [order.index(a) for a in AXES]
     return Placement(degrees, np.ascontiguousarray(shaped.transpose(perm)))
+
+
+def stage_split(n_layers: int, pp: int) -> list[range]:
+    """Contiguous layer ranges of the pp stages, as even as possible (earlier
+    stages take the extra layers). A framework policy, owned here."""
+    if n_layers < pp:
+        raise ValueError(f"{n_layers} layers cannot fill pp = {pp} stages")
+    base, extra = divmod(n_layers, pp)
+    out, start = [], 0
+    for s in range(pp):
+        n = base + (1 if s < extra else 0)
+        out.append(range(start, start + n))
+        start += n
+    return out
