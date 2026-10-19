@@ -1,0 +1,30 @@
+{
+  "kind": "gpu",
+  "name": "h100-sxm",
+  "values": {
+    "sms": {"value": 132, "kind": "specification",
+            "source": "https://www.megware.com/fileadmin/user_upload/LandingPage%20NVIDIA/nvidia-h100-datasheet.pdf"},
+    "clock_hz": {"value": 1.83e9, "kind": "specification",
+                 "source": "the clock at which the datasheet's dense peak holds: 989.4 TFLOPS BF16 = 132 SMs x 4096 FLOPs per clock x 1.83 GHz"},
+    "tensor_flops_per_clock_per_sm": {"value": {"bf16": 4096, "fp16": 4096, "fp8": 8192, "tf32": 2048},
+                                      "kind": "specification", "source": "https://glennklockwood.com/garden/processors/H100"},
+    "vector_flops": {"value": 66.9e12, "kind": "specification", "source": "datasheet: FP32 non-tensor, SXM"},
+    "hbm_bytes_per_s": {"value": 3.35e12, "kind": "specification", "source": "datasheet: HBM3, SXM"},
+    "hbm_capacity": {"value": 80e9, "kind": "specification", "source": "datasheet: 80 GB"},
+    "eta_gemm": {"value": {"bf16": 0.73, "fp16": 0.73, "fp8": 0.65}, "kind": "measured", "confidence": "medium",
+                 "source": "https://newsletter.semianalysis.com/p/mi300x-vs-h100-vs-h200-benchmark-part-1-training (Llama-70B GEMM shapes)"},
+    "eta_hbm": {"value": 0.85, "kind": "assumed", "confidence": "low",
+                "source": "no trustworthy public value; an unsourced summary gives 2.5-3 TB/s sustained (75-90% of peak). Measure with an HBM copy or triad kernel."},
+    "tile": {"value": [128, 256], "kind": "theory", "source": "one CUTLASS/cuBLAS Hopper tile shape (M x N); level A of the compute model"},
+    "nvlink_rate": {"value": 375e9, "kind": "measured", "confidence": "medium-high",
+                    "source": "GPU-to-GPU about 380 GB/s; NCCL ring bus bandwidth 365-370 GB/s (https://github.com/NVIDIA/nccl-tests/issues/212)"},
+    "nvls_level": {"value": 0.82, "kind": "measured", "confidence": "medium",
+                   "source": "8-GPU NVLS all-reduce about 480 GB/s bus bandwidth against the port bound 2(n-1)/(n+1) x 375 GB/s"},
+    "nic_rate": {"value": 49e9, "kind": "theory", "source": "400 Gb/s ConnectX-7 x 0.98 payload; ib_write_bw measures 49 GB/s"},
+    "pcie_rate": {"value": 55.4e9, "kind": "theory", "source": "PCIe Gen5 x16: 63 GB/s x 0.88 packet efficiency; measured 55-56 GB/s"},
+    "launch_eager_s": {"value": 3e-6, "kind": "measured", "confidence": "medium-low",
+                       "source": "about 3 us for a null kernel on recent hardware (NVIDIA developer forum)"},
+    "graph_node_s": {"value": 0.5e-6, "kind": "measured", "confidence": "medium",
+                     "source": "https://developer.nvidia.com/blog/cuda-graphs (V100 era)"}
+  }
+}
